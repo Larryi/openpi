@@ -19,8 +19,11 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.kuavo_policy as kuavo_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so101_policy as so101_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -62,9 +65,26 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotDatasetConfig:
+    """One LeRobot dataset participating in a virtual weighted mixture."""
+
+    name: str
+    repo_id: str
+    root: str | None = None
+    weight: float = 1.0
+    episodes: Sequence[int] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Existing local LeRobot dataset directory. When set, no Hub download or data copy is needed.
+    root: str | None = None
+    # Optional virtual mixture. When non-empty, these datasets replace the single repo_id/root input.
+    # Each source is opened independently, so roots may point at unrelated local directories and the same
+    # dataset may be included more than once with disjoint episode subsets.
+    lerobot_datasets: Sequence[LeRobotDatasetConfig] = ()
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -90,6 +110,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional local-dataset schema checks. These fail before training if the selected dataset has a
+    # different robot layout from the one for which the transforms and normalization stats were configured.
+    expected_codebase_version: str | None = None
+    expected_robot_type: str | None = None
+    expected_state_names: Sequence[str] | None = None
+    expected_action_names: Sequence[str] | None = None
+    required_camera_keys: Sequence[str] = ()
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -109,6 +137,8 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # Optional local SentencePiece model. If unset, the standard tokenizer is downloaded/cached.
+    tokenizer_path: str | None = None
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -118,7 +148,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len, self.tokenizer_path),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -130,7 +160,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len, self.tokenizer_path),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
@@ -167,6 +197,10 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    # Existing local LeRobot dataset directory.
+    root: str | None = None
+    # Optional virtual weighted mixture of local or Hub LeRobot datasets.
+    lerobot_datasets: Sequence[LeRobotDatasetConfig] = ()
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -182,6 +216,8 @@ class DataConfigFactory(abc.ABC):
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            root=self.root,
+            lerobot_datasets=tuple(self.lerobot_datasets),
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -356,6 +392,84 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotKuavoDataConfig(DataConfigFactory):
+    """LeRobot v3 data configuration for Kuavo joint-position datasets."""
+
+    action_dim: int = 8
+    state_action_names: Sequence[str] = kuavo_policy.TASK1_STATE_ACTION_NAMES
+    camera_keys: Sequence[str] = kuavo_policy.TASK1_CAMERA_KEYS
+    delta_action_mask: Sequence[bool] = kuavo_policy.TASK1_DELTA_ACTION_MASK
+    tokenizer_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.state_action_names) != self.action_dim:
+            raise ValueError(f"Expected {self.action_dim} Kuavo state/action names, got {len(self.state_action_names)}")
+        if len(self.delta_action_mask) != self.action_dim:
+            raise ValueError(f"Expected a {self.action_dim}-element delta mask, got {len(self.delta_action_mask)}")
+
+    def data_transform_group(self) -> _transforms.Group:
+        return _transforms.Group(
+            inputs=[
+                kuavo_policy.KuavoInputs(),
+                _transforms.DeltaActions(self.delta_action_mask),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(self.delta_action_mask),
+                kuavo_policy.KuavoOutputs(action_dim=self.action_dim),
+            ],
+        )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.action_dim > model_config.action_dim:
+            raise ValueError(f"Kuavo action_dim {self.action_dim} exceeds model action_dim {model_config.action_dim}")
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=self.data_transform_group(),
+            model_transforms=ModelTransformFactory(tokenizer_path=self.tokenizer_path)(model_config),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+            expected_codebase_version="v3.0",
+            expected_robot_type="kuavo4pro",
+            expected_state_names=tuple(self.state_action_names),
+            expected_action_names=tuple(self.state_action_names),
+            required_camera_keys=tuple(self.camera_keys),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSO101DataConfig(DataConfigFactory):
+    """LeRobot v3 data configuration for absolute-position SO-101 datasets."""
+
+    tokenizer_path: str | None = None
+
+    def data_transform_group(self) -> _transforms.Group:
+        return _transforms.Group(
+            inputs=[so101_policy.SO101Inputs()],
+            outputs=[so101_policy.SO101Outputs()],
+        )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if len(so101_policy.STATE_ACTION_NAMES) > model_config.action_dim:
+            raise ValueError("SO-101 action layout exceeds the model action dimension")
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=self.data_transform_group(),
+            model_transforms=ModelTransformFactory(tokenizer_path=self.tokenizer_path)(model_config),
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+            expected_codebase_version="v3.0",
+            expected_robot_type="so101_follower",
+            expected_state_names=so101_policy.STATE_ACTION_NAMES,
+            expected_action_names=so101_policy.STATE_ACTION_NAMES,
+            required_camera_keys=so101_policy.CAMERA_KEYS,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -514,6 +628,8 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Save checkpoints asynchronously by default. Disable for constrained smoke-test environments.
+    async_checkpointing: bool = True
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -760,6 +876,209 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_kuavo",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="kuavo_task1",
+            root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task1"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_kuavo_task2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="kuavo_task2",
+            root="/mnt/pqssd/Real_PQ_3.0/TASK2_SZ_Repaired/lerobot_task2_264",
+            action_dim=16,
+            state_action_names=kuavo_policy.TASK2_STATE_ACTION_NAMES,
+            camera_keys=kuavo_policy.TASK2_CAMERA_KEYS,
+            delta_action_mask=kuavo_policy.TASK2_DELTA_ACTION_MASK,
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_kuavo_task1_mixed",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="kuavo_task1_sz_bj_mixed",
+            lerobot_datasets=(
+                LeRobotDatasetConfig(
+                    name="beijing_main",
+                    repo_id="kuavo_task1_bj_220",
+                    root="/mnt/pqssd/Real_Beijing_Lerobot/task1_220_bj",
+                    weight=0.55,
+                    episodes=tuple(range(104)),
+                ),
+                LeRobotDatasetConfig(
+                    name="beijing_slave",
+                    repo_id="kuavo_task1_bj_220",
+                    root="/mnt/pqssd/Real_Beijing_Lerobot/task1_220_bj",
+                    weight=0.20,
+                    episodes=tuple(range(104, 220)),
+                ),
+                LeRobotDatasetConfig(
+                    name="suzhou_repaired",
+                    repo_id="kuavo_task1_sz_345",
+                    root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
+                    weight=0.25,
+                ),
+            ),
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task1_sz_bj_mixed"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_kuavo_task2_mixed",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="kuavo_task2_sz_bj_mixed",
+            lerobot_datasets=(
+                LeRobotDatasetConfig(
+                    name="beijing_main",
+                    repo_id="kuavo_task2_bj_208",
+                    root="/mnt/pqssd/Real_Beijing_Lerobot/task2_208_bj",
+                    weight=0.55,
+                    episodes=tuple(range(102)),
+                ),
+                LeRobotDatasetConfig(
+                    name="beijing_slave",
+                    repo_id="kuavo_task2_bj_208",
+                    root="/mnt/pqssd/Real_Beijing_Lerobot/task2_208_bj",
+                    weight=0.20,
+                    episodes=tuple(range(102, 208)),
+                ),
+                LeRobotDatasetConfig(
+                    name="suzhou_repaired",
+                    repo_id="kuavo_task2_sz_264",
+                    root="/mnt/pqssd/Real_PQ_3.0/TASK2_SZ_Repaired/lerobot_task2_264",
+                    weight=0.25,
+                ),
+            ),
+            action_dim=16,
+            state_action_names=kuavo_policy.TASK2_STATE_ACTION_NAMES,
+            camera_keys=kuavo_policy.TASK2_CAMERA_KEYS,
+            delta_action_mask=kuavo_policy.TASK2_DELTA_ACTION_MASK,
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task2_sz_bj_mixed"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_so101_60",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="so101_grab_blue_pen_60",
+            root="/mnt/pqssd/so101/datasets/merged_grab_blue_pen_60",
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(asset_id="so101_grab_blue_pen_60"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_so101_90",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+        ),
+        data=LeRobotSO101DataConfig(
+            repo_id="so101_grab_blue_pen_90",
+            root="/mnt/pqssd/so101/datasets/merged_lerobot_dataset_with_dagger30_trimmed",
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(asset_id="so101_grab_blue_pen_90"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
+        batch_size=1,
+        num_workers=4,
+        num_train_steps=30_000,
+        wandb_enabled=False,
+    ),
+    # CPU-friendly pipeline/checkpoint smoke config. This exercises the Pi0.5 JAX code path with
+    # tiny dummy model variants; it is not a substitute for fine-tuning the real pi05_base weights.
+    TrainConfig(
+        name="pi05_kuavo_smoke",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=True,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            vision_variant="mu/14",
+        ),
+        data=LeRobotKuavoDataConfig(
+            repo_id="kuavo_task1",
+            root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
+            tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
+            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task1"),
+        ),
+        batch_size=1,
+        num_workers=0,
+        num_train_steps=10,
+        log_interval=1,
+        save_interval=10,
+        keep_period=10,
+        async_checkpointing=False,
+        freeze_filter=nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*(action_in_proj|action_out_proj|time_mlp).*$")),
+        ),
+        ema_decay=None,
+        exp_name="smoke",
+        wandb_enabled=False,
     ),
     #
     # Fine-tuning Aloha configs.

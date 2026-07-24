@@ -68,7 +68,19 @@ class Policy(BasePolicy):
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        rtc = inputs.pop("rtc", None)
+        if rtc is not None:
+            if self._is_pytorch_model:
+                raise ValueError("RTC requests are currently supported only by the OpenPI JAX Pi0/Pi0.5 model")
+            if "prev_actions" not in rtc:
+                raise ValueError("RTC request is missing prev_actions")
+            # Feed physical-space leftover actions through the exact training input pipeline so normalization and action
+            # padding match the model. SO101Inputs maps the dataset-style singular key to model-space `actions`.
+            inputs["action"] = np.asarray(rtc["prev_actions"], dtype=np.float32)
         inputs = self._input_transform(inputs)
+        rtc_prev_actions = inputs.pop("actions", None) if rtc is not None else None
+        if rtc is not None and rtc_prev_actions is None:
+            raise ValueError("The configured input transforms did not produce normalized RTC actions")
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -80,6 +92,31 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if rtc is not None:
+            prev_actions = np.asarray(rtc_prev_actions, dtype=np.float32)
+            if prev_actions.ndim != 2:
+                raise ValueError(f"RTC prev_actions must have shape [T, A], got {prev_actions.shape}")
+            if prev_actions.shape[0] > self._model.action_horizon:
+                prev_actions = prev_actions[: self._model.action_horizon]
+            elif prev_actions.shape[0] < self._model.action_horizon:
+                prev_actions = np.pad(
+                    prev_actions,
+                    ((0, self._model.action_horizon - prev_actions.shape[0]), (0, 0)),
+                )
+            execution_horizon = int(rtc.get("execution_horizon", 10))
+            inference_delay = int(rtc.get("inference_delay", 0))
+            if not 0 <= inference_delay <= self._model.action_horizon:
+                raise ValueError(f"RTC inference_delay must be in [0, {self._model.action_horizon}]")
+            if not 1 <= execution_horizon <= self._model.action_horizon:
+                raise ValueError(f"RTC execution_horizon must be in [1, {self._model.action_horizon}]")
+            sample_kwargs.update(
+                rtc_prev_actions=jnp.asarray(prev_actions)[None, ...],
+                rtc_inference_delay=jnp.asarray(inference_delay, dtype=jnp.int32),
+                rtc_execution_horizon=jnp.asarray(execution_horizon, dtype=jnp.int32),
+                rtc_max_guidance_weight=jnp.asarray(
+                    float(rtc.get("max_guidance_weight", 10.0)), dtype=jnp.float32
+                ),
+            )
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 

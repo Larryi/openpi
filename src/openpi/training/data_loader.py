@@ -1,3 +1,4 @@
+import bisect
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -7,7 +8,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -60,6 +61,59 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+    @property
+    def dataset(self) -> Dataset:
+        return self._dataset
+
+
+class WeightedLeRobotDataset(Dataset):
+    """Concatenates LeRobot datasets while retaining source-level sampling weights."""
+
+    def __init__(self, datasets: Sequence[Dataset], sources: Sequence[_config.LeRobotDatasetConfig]):
+        if not datasets or len(datasets) != len(sources):
+            raise ValueError("WeightedLeRobotDataset requires one non-empty dataset per source")
+
+        names = [source.name for source in sources]
+        if len(set(names)) != len(names):
+            raise ValueError(f"LeRobot mixture source names must be unique, got {names}")
+        if any(source.weight <= 0 for source in sources):
+            raise ValueError("LeRobot mixture weights must be positive")
+        if any(len(dataset) == 0 for dataset in datasets):
+            raise ValueError("LeRobot mixture sources must contain at least one frame")
+
+        self.datasets = tuple(datasets)
+        self.sources = tuple(sources)
+        self.cumulative_sizes = np.cumsum([len(dataset) for dataset in datasets]).tolist()
+
+    def __getitem__(self, index: SupportsIndex):
+        index = index.__index__()
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        source_index = bisect.bisect_right(self.cumulative_sizes, index)
+        source_start = 0 if source_index == 0 else self.cumulative_sizes[source_index - 1]
+        return self.datasets[source_index][index - source_start]
+
+    def __len__(self) -> int:
+        return self.cumulative_sizes[-1]
+
+    def source_index(self, index: int) -> int:
+        """Return the source containing a concatenated dataset index."""
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return bisect.bisect_right(self.cumulative_sizes, index)
+
+    @property
+    def sampling_weights(self) -> torch.Tensor:
+        """Per-frame weights whose source-level sums equal the configured source weights."""
+        return torch.cat(
+            [
+                torch.full((len(dataset),), source.weight / len(dataset), dtype=torch.double)
+                for dataset, source in zip(self.datasets, self.sources, strict=True)
+            ]
+        )
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -137,18 +191,134 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    if data_config.lerobot_datasets:
+        datasets = []
+        expected_fps = None
+        for source in data_config.lerobot_datasets:
+            dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(source.repo_id, root=source.root)
+            validate_lerobot_metadata(dataset_meta, data_config, source=source)
+            if expected_fps is None:
+                expected_fps = dataset_meta.fps
+            elif dataset_meta.fps != expected_fps:
+                raise ValueError(
+                    f"All LeRobot mixture sources must have the same fps; expected {expected_fps}, "
+                    f"got {dataset_meta.fps} for {source.name!r}"
+                )
+            datasets.append(
+                lerobot_dataset.LeRobotDataset(
+                    source.repo_id,
+                    root=source.root,
+                    episodes=list(source.episodes) if source.episodes is not None else None,
+                    delta_timestamps={
+                        key: [t / dataset_meta.fps for t in range(action_horizon)]
+                        for key in data_config.action_sequence_keys
+                    },
+                )
+            )
+            logging.info(
+                "Loaded LeRobot mixture source %s: frames=%d episodes=%s weight=%.4f root=%s",
+                source.name,
+                len(datasets[-1]),
+                "all" if source.episodes is None else len(source.episodes),
+                source.weight,
+                source.root,
+            )
+        dataset = WeightedLeRobotDataset(datasets, data_config.lerobot_datasets)
+    else:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.root)
+        validate_lerobot_metadata(dataset_meta, data_config)
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            root=data_config.root,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+        )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask()])
 
     return dataset
+
+
+def validate_lerobot_metadata(
+    dataset_meta,
+    data_config: _config.DataConfig,
+    *,
+    source: _config.LeRobotDatasetConfig | None = None,
+) -> None:
+    """Validate optional robot-specific expectations before opening videos or starting training."""
+    location = source.root if source is not None else data_config.root
+    source_name = source.name if source is not None else data_config.repo_id
+
+    if (
+        data_config.expected_codebase_version is not None
+        and dataset_meta.info.get("codebase_version") != data_config.expected_codebase_version
+    ):
+        raise ValueError(
+            f"Expected LeRobot {data_config.expected_codebase_version}, got "
+            f"{dataset_meta.info.get('codebase_version')!r} for {source_name!r} at {location}"
+        )
+
+    if (
+        data_config.expected_robot_type is not None
+        and dataset_meta.info.get("robot_type") != data_config.expected_robot_type
+    ):
+        raise ValueError(
+            f"Expected robot_type {data_config.expected_robot_type!r}, got "
+            f"{dataset_meta.info.get('robot_type')!r} for {source_name!r} at {location}"
+        )
+
+    def feature_names(key: str, name_key: str) -> tuple[str, ...]:
+        feature = dataset_meta.features.get(key)
+        if feature is None:
+            raise ValueError(f"Required LeRobot feature {key!r} is missing for {source_name!r} at {location}")
+        names = feature.get("names")
+        if isinstance(names, (list, tuple)):
+            return tuple(names)
+        if not isinstance(names, dict) or name_key not in names:
+            raise ValueError(
+                f"LeRobot feature {key!r} has no {name_key!r} metadata for {source_name!r} at {location}"
+            )
+        return tuple(names[name_key])
+
+    for key, name_key, expected in (
+        ("observation.state", "state_names", data_config.expected_state_names),
+        ("action", "action_names", data_config.expected_action_names),
+    ):
+        if expected is not None and (actual := feature_names(key, name_key)) != tuple(expected):
+            raise ValueError(
+                f"Unexpected {key} layout for {source_name!r} at {location}: "
+                f"expected {tuple(expected)}, got {actual}"
+            )
+
+    missing_cameras = set(data_config.required_camera_keys) - set(dataset_meta.camera_keys)
+    if missing_cameras:
+        raise ValueError(
+            f"Required cameras are missing for {source_name!r} at {location}: {sorted(missing_cameras)}"
+        )
+
+
+def create_weighted_sampler(
+    dataset: Dataset,
+    *,
+    num_samples: int | None = None,
+    seed: int = 0,
+) -> torch.utils.data.WeightedRandomSampler | None:
+    """Create a replacement sampler when the dataset is a configured weighted mixture."""
+    while isinstance(dataset, TransformedDataset):
+        dataset = dataset.dataset
+    if not isinstance(dataset, WeightedLeRobotDataset):
+        return None
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.WeightedRandomSampler(
+        dataset.sampling_weights,
+        num_samples=num_samples or len(dataset),
+        replacement=True,
+        generator=generator,
+    )
 
 
 def create_rlds_dataset(
@@ -300,14 +470,16 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    sampler = create_weighted_sampler(dataset, seed=seed)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
-    sampler = None
     if framework == "pytorch":
         if torch.distributed.is_initialized():
+            if sampler is not None:
+                raise NotImplementedError("Weighted LeRobot mixtures are not yet supported with PyTorch DDP")
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
                 num_replicas=torch.distributed.get_world_size(),

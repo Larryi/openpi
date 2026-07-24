@@ -20,6 +20,10 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    vision_variant: str = "So400m/14"
+    # Controls activation rematerialization for both Gemma and SigLIP. Keeping dot outputs uses more memory but
+    # avoids recomputing expensive matrix multiplications during the backward pass.
+    remat_policy: str = "nothing_saveable"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -35,6 +39,8 @@ class Pi0Config(_model.BaseModelConfig):
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
+        if self.remat_policy != "none" and not hasattr(jax.checkpoint_policies, self.remat_policy):
+            raise ValueError(f"Unknown JAX checkpoint policy: {self.remat_policy}")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

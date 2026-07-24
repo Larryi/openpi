@@ -16,6 +16,19 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+def get_rtc_prefix_weights(
+    inference_delay: at.Int[at.Array, ""], execution_horizon: at.Int[at.Array, ""], action_horizon: int
+) -> jax.Array:
+    """Build the linear schedule from Physical Intelligence's official RTC implementation.
+
+    https://github.com/Physical-Intelligence/real-time-chunking-kinetix/blob/main/src/model.py
+    """
+    start = jnp.minimum(inference_delay, execution_horizon)
+    indices = jnp.arange(action_horizon)
+    weights = jnp.clip((start - 1 - indices) / (execution_horizon - start + 1) + 1, 0, 1)
+    return jnp.where(indices >= execution_horizon, 0, weights)
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -75,15 +88,17 @@ class Pi0(_model.BaseModel):
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=config.pi05,
+                remat_policy=config.remat_policy,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant="So400m/14",
+                variant=config.vision_variant,
                 pool_type="none",
                 scan=True,
+                remat_policy=config.remat_policy,
                 dtype_mm=config.dtype,
             )
         )
@@ -221,6 +236,10 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_prev_actions: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_inference_delay: int | at.Int[at.Array, ""] = 0,
+        rtc_execution_horizon: int | at.Int[at.Array, ""] = 10,
+        rtc_max_guidance_weight: float | at.Float[at.Array, ""] = 10.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -238,35 +257,58 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            def denoise_step(current_x_t):
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    observation, current_x_t, jnp.broadcast_to(time, batch_size)
+                )
+                # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to
+                # each other.
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to
+                # the prefix tokens.
+                suffix_to_prefix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn_mask = jnp.concatenate([suffix_to_prefix_mask, suffix_attn_mask], axis=-1)
+                assert full_attn_mask.shape == (
+                    batch_size,
+                    suffix_tokens.shape[1],
+                    prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                )
+                suffix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=suffix_positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                assert prefix_out is None
+                return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            if rtc_prev_actions is None:
+                v_t = denoise_step(x_t)
+            else:
+                # OpenPI integrates from t=1 (noise) to t=0 (actions), so x_0 = x_t - t*v_t and the guidance sign is
+                # reversed relative to the official implementation's t=0 -> t=1 convention.
+                def predict_actions(current_x_t):
+                    velocity = denoise_step(current_x_t)
+                    return current_x_t - time * velocity, velocity
+
+                predicted_actions, vjp_fn, v_t = jax.vjp(predict_actions, x_t, has_aux=True)
+                prefix_weights = get_rtc_prefix_weights(
+                    jnp.asarray(rtc_inference_delay), jnp.asarray(rtc_execution_horizon), self.action_horizon
+                )
+                error = (rtc_prev_actions - predicted_actions) * prefix_weights[None, :, None]
+                correction = vjp_fn(error)[0]
+
+                tau = 1 - time
+                inverse_variance = ((1 - tau) ** 2 + tau**2) / (1 - tau) ** 2
+                guidance_scale = jnp.nan_to_num(
+                    (1 - tau) / tau, posinf=rtc_max_guidance_weight
+                ) * inverse_variance
+                guidance_scale = jnp.minimum(guidance_scale, rtc_max_guidance_weight)
+                v_t = v_t - guidance_scale * correction
 
             return x_t + dt * v_t, time + dt
 

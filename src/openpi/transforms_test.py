@@ -119,3 +119,8 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_extract_prompt_from_v3_task_string():
+    transform = _transforms.PromptFromLeRobotTask()
+    assert transform({"task": "Hello from v3"})["prompt"] == "Hello from v3"

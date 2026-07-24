@@ -5,6 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
@@ -32,6 +35,12 @@ def create_torch_dataloader(
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // batch_size
+    else:
+        num_batches = len(dataset) // batch_size
+    num_samples = num_batches * batch_size
+    sampler = _data_loader.create_weighted_sampler(dataset, num_samples=num_samples)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -41,17 +50,13 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
-    if max_frames is not None and max_frames < len(dataset):
-        num_batches = max_frames // batch_size
-        shuffle = True
-    else:
-        num_batches = len(dataset) // batch_size
-        shuffle = False
+    shuffle = sampler is None and max_frames is not None and max_frames < len(dataset)
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
         num_workers=num_workers,
         shuffle=shuffle,
+        sampler=sampler,
         num_batches=num_batches,
     )
     return data_loader, num_batches
@@ -86,8 +91,31 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    dataset_root: str | None = None,
+    tokenizer_path: str | None = None,
+    assets_base_dir: str | None = None,
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+):
     config = _config.get_config(config_name)
+    if assets_base_dir is not None:
+        config = dataclasses.replace(config, assets_base_dir=assets_base_dir)
+    data_overrides = {}
+    if dataset_root is not None:
+        data_overrides["root"] = str(pathlib.Path(dataset_root).expanduser().resolve())
+    if tokenizer_path is not None:
+        data_overrides["tokenizer_path"] = str(pathlib.Path(tokenizer_path).expanduser().resolve())
+    if data_overrides:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, **data_overrides))
+    if batch_size is not None or num_workers is not None:
+        config = dataclasses.replace(
+            config,
+            batch_size=batch_size or config.batch_size,
+            num_workers=num_workers if num_workers is not None else config.num_workers,
+        )
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:

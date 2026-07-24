@@ -310,12 +310,18 @@ class ExtractFASTActions(DataTransformFn):
 class PromptFromLeRobotTask(DataTransformFn):
     """Extracts a prompt from the current LeRobot dataset task."""
 
-    # Contains the LeRobot dataset tasks (dataset.meta.tasks).
-    tasks: dict[int, str]
+    # Optional v2.1 task-index mapping. LeRobot v3 items contain the task string directly.
+    tasks: dict[int, str] | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
+        if "task" in data:
+            task = data["task"]
+            return {**data, "prompt": task if isinstance(task, str) else task.item()}
+
         if "task_index" not in data:
-            raise ValueError('Cannot extract prompt without "task_index"')
+            raise ValueError('Cannot extract prompt without "task" or "task_index"')
+        if self.tasks is None:
+            raise ValueError('A task mapping is required for items without a string "task" field')
 
         task_index = int(data["task_index"])
         if (prompt := self.tasks.get(task_index)) is None:
