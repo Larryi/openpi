@@ -4,6 +4,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
 import os
 import pathlib
@@ -74,6 +75,46 @@ class LeRobotDatasetConfig:
     root: str | None = None
     weight: float = 1.0
     episodes: Sequence[int] | None = None
+
+
+def _kuavo_mix_payload() -> list[dict]:
+    raw = os.environ.get("KUAVO_DATASET_MIX_JSON", "").strip()
+    if not raw:
+        return []
+    payload = json.loads(raw)
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("KUAVO_DATASET_MIX_JSON must be a non-empty JSON list")
+    return payload
+
+
+def _kuavo_mix_from_env() -> tuple[LeRobotDatasetConfig, ...]:
+    sources = []
+    for index, item in enumerate(_kuavo_mix_payload(), 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Dataset mixture item {index} must be an object")
+        sources.append(
+            LeRobotDatasetConfig(
+                name=str(item.get("name") or f"source_{index:02d}"),
+                repo_id=str(item["repo_id"]),
+                root=str(item["root"]),
+                weight=float(item["weight"]),
+                episodes=(
+                    tuple(int(value) for value in item["episodes"])
+                    if item.get("episodes") is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(sources)
+
+
+def _kuavo_mix_asset_id(default: str) -> str:
+    return os.environ.get("KUAVO_MIX_ASSET_ID", default)
+
+
+def _kuavo_mix_primary_root(default: str) -> str:
+    payload = _kuavo_mix_payload()
+    return str(payload[0]["root"]) if payload else default
 
 
 @dataclasses.dataclass(frozen=True)
@@ -887,15 +928,18 @@ _CONFIGS = [
             discrete_state_input=True,
         ),
         data=LeRobotKuavoDataConfig(
-            repo_id="kuavo_task1",
-            root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
+            repo_id=_kuavo_mix_asset_id("kuavo_task1"),
+            root=_kuavo_mix_primary_root(
+                "/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345"
+            ),
+            lerobot_datasets=_kuavo_mix_from_env(),
             tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
             assets=AssetsConfig(
                 assets_dir=os.environ.get(
                     "OPENPI_KUAVO_TASK1_ASSETS_DIR",
                     "./assets/pi05_kuavo",
                 ),
-                asset_id="kuavo_task1",
+                asset_id=_kuavo_mix_asset_id("kuavo_task1"),
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
@@ -913,8 +957,11 @@ _CONFIGS = [
             discrete_state_input=True,
         ),
         data=LeRobotKuavoDataConfig(
-            repo_id="kuavo_task2",
-            root="/mnt/pqssd/Real_PQ_3.0/TASK2_SZ_Repaired/lerobot_task2_264",
+            repo_id=_kuavo_mix_asset_id("kuavo_task2"),
+            root=_kuavo_mix_primary_root(
+                "/mnt/pqssd/Real_PQ_3.0/TASK2_SZ_Repaired/lerobot_task2_264"
+            ),
+            lerobot_datasets=_kuavo_mix_from_env(),
             action_dim=16,
             state_action_names=kuavo_policy.TASK2_STATE_ACTION_NAMES,
             camera_keys=kuavo_policy.TASK2_CAMERA_KEYS,

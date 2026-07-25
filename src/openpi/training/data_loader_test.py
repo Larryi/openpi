@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import types
 
 import jax
@@ -62,6 +63,23 @@ def test_kuavo_mixed_configs_preserve_episode_domains():
     assert task1[1].episodes == tuple(range(104, 220))
     assert task2[0].episodes == tuple(range(102))
     assert task2[1].episodes == tuple(range(102, 208))
+
+
+def test_kuavo_runtime_mix_parses_resolved_hf_sources(monkeypatch):
+    payload = [
+        {"name": "sz", "repo_id": "owner/sz", "root": "/datasets/sz", "weight": 0.25},
+        {"name": "bj", "repo_id": "owner/bj", "root": "/datasets/bj", "weight": 0.75},
+    ]
+    monkeypatch.setenv("KUAVO_DATASET_MIX_JSON", json.dumps(payload))
+    monkeypatch.setenv("KUAVO_MIX_ASSET_ID", "kuavo_task1_mix_123")
+
+    sources = _config._kuavo_mix_from_env()
+    assert [(source.repo_id, source.root, source.weight) for source in sources] == [
+        ("owner/sz", "/datasets/sz", 0.25),
+        ("owner/bj", "/datasets/bj", 0.75),
+    ]
+    assert _config._kuavo_mix_primary_root("/fallback") == "/datasets/sz"
+    assert _config._kuavo_mix_asset_id("fallback") == "kuavo_task1_mix_123"
 
 
 def test_validate_lerobot_metadata_accepts_list_feature_names():

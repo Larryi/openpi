@@ -30,6 +30,7 @@ umask 077
 : "${AUTO_UPLOAD:=1}"
 : "${OVERWRITE:=0}"
 : "${RESUME:=0}"
+: "${RESUME_REPO:=${MODEL_REPO}}"
 : "${AUTO_STOP_INSTANCE:=0}"
 : "${AUTO_STOP_ON_FAILURE:=0}"
 : "${AUTO_STOP_ON_UPLOAD_FAILURE:=0}"
@@ -45,6 +46,7 @@ umask 077
 : "${LR_TAIL_START_STEP:=}"
 : "${LR_TAIL_DECAY_STEPS:=}"
 : "${LR_TAIL_DECAY_LR:=}"
+: "${DATASET_MIX_JSON:=}"
 
 for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE; do
   [[ "${!value}" == "0" || "${!value}" == "1" ]] || {
@@ -207,6 +209,7 @@ LOG_DIR="${WORK_ROOT}/logs/${RUN_ID}"
 TRAIN_LOG="${LOG_DIR}/train.log"
 PIPELINE_LOG="${LOG_DIR}/pipeline.log"
 MANIFEST="${LOG_DIR}/run_manifest.json"
+MIX_RESOLVED_FILE="${LOG_DIR}/dataset_mix.resolved.json"
 if [[ "${PYTHON_VERSION}" != "3.11" ]]; then
   echo "This frozen OpenPI environment requires PYTHON_VERSION=3.11 because mujoco 2.3.7 has no Python 3.12 wheel" >&2
   exit 2
@@ -473,8 +476,79 @@ PY
 
 PIPELINE_PHASE="download dataset and tokenizer"
 mkdir -p "${DATASET_ROOT}" "${TOKENIZER_DIR}"
-DATASET_REPO="${DATASET_REPO}" DATASET_ROOT="${DATASET_ROOT}" \
-HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" "${PYTHON}" - <<'PY'
+if [[ -n "${DATASET_MIX_JSON}" ]]; then
+  DATASET_MIX_JSON="${DATASET_MIX_JSON}" WORK_ROOT="${WORK_ROOT}" \
+  MIX_RESOLVED_FILE="${MIX_RESOLVED_FILE}" HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
+  EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM}" EXPECTED_FPS="${EXPECTED_FPS}" \
+  EXPECTED_ROBOT_TYPE="${EXPECTED_ROBOT_TYPE}" EXPECTED_CAMERAS="${EXPECTED_CAMERAS}" \
+  "${PYTHON}" - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+from huggingface_hub import snapshot_download
+
+sources = json.loads(os.environ["DATASET_MIX_JSON"])
+if not isinstance(sources, list) or not sources:
+    raise ValueError("DATASET_MIX_JSON must be a non-empty JSON list")
+total_weight = sum(float(source["weight"]) for source in sources)
+if total_weight <= 0 or any(float(source["weight"]) <= 0 for source in sources):
+    raise ValueError("Dataset mixture weights must be positive")
+root = Path(os.environ["WORK_ROOT"]) / "datasets" / "mixture"
+expected_cameras = set(os.environ["EXPECTED_CAMERAS"].split(","))
+resolved = []
+for index, source in enumerate(sources, 1):
+    repo_id = str(source["repo_id"])
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_id)
+    local_root = root / f"{index:02d}_{safe_name}"
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        local_dir=local_root,
+        max_workers=int(os.environ["HF_DOWNLOAD_WORKERS"]),
+        token=os.environ["HF_TOKEN"],
+    )
+    info = json.loads((local_root / "meta/info.json").read_text())
+    assert info["codebase_version"] == "v3.0", (repo_id, info)
+    assert info["robot_type"] == os.environ["EXPECTED_ROBOT_TYPE"], (repo_id, info["robot_type"])
+    assert info["fps"] == int(os.environ["EXPECTED_FPS"]), (repo_id, info["fps"])
+    action_dim = int(os.environ["EXPECTED_ACTION_DIM"])
+    assert info["features"]["action"]["shape"] == [action_dim], (repo_id, info["features"]["action"])
+    assert info["features"]["observation.state"]["shape"] == [action_dim], (
+        repo_id,
+        info["features"]["observation.state"],
+    )
+    assert not any("depth" in key for key in info["features"]), (repo_id, info["features"].keys())
+    actual_cameras = {
+        key for key in info["features"] if key.startswith("observation.images.")
+    }
+    assert actual_cameras == expected_cameras, (repo_id, actual_cameras, expected_cameras)
+    resolved.append({
+        "name": str(source.get("name") or f"source_{index:02d}"),
+        "repo_id": repo_id,
+        "root": str(local_root),
+        "weight": float(source["weight"]) / total_weight,
+    })
+
+output = Path(os.environ["MIX_RESOLVED_FILE"])
+output.write_text(json.dumps(resolved, indent=2))
+digest = hashlib.sha256(json.dumps(resolved, sort_keys=True).encode()).hexdigest()[:10]
+(output.parent / "dataset_mix.asset_id").write_text(digest)
+print("Weighted dataset mixture ready:")
+for source in resolved:
+    print(f"  {source['repo_id']} weight={source['weight']:.6f} root={source['root']}")
+PY
+  export KUAVO_DATASET_MIX_JSON
+  KUAVO_DATASET_MIX_JSON="$(<"${MIX_RESOLVED_FILE}")"
+  DATASET_ROOT="$("${PYTHON}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["root"])' "${MIX_RESOLVED_FILE}")"
+  DATASET_REPO="$("${PYTHON}" -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["repo_id"])' "${MIX_RESOLVED_FILE}")"
+  mix_digest="$(<"${LOG_DIR}/dataset_mix.asset_id")"
+  NORM_ASSET_ID="${NORM_ASSET_ID}_mix_${mix_digest}"
+  export KUAVO_MIX_ASSET_ID="${NORM_ASSET_ID}"
+else
+  DATASET_REPO="${DATASET_REPO}" DATASET_ROOT="${DATASET_ROOT}" \
+  HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" "${PYTHON}" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
@@ -486,6 +560,7 @@ snapshot_download(
     token=os.environ["HF_TOKEN"],
 )
 PY
+fi
 if [[ ! -s "${TOKENIZER_PATH}" ]]; then
   PALIGEMMA_REPO="${PALIGEMMA_REPO}" TOKENIZER_DIR="${TOKENIZER_DIR}" "${PYTHON}" - <<'PY'
 import os
@@ -512,7 +587,8 @@ PY
 echo "JAX base params ready: ${BASE_PARAMS}"
 
 PIPELINE_PHASE="validate LeRobot v3 dataset"
-DATASET_ROOT="${DATASET_ROOT}" EXPECTED_EPISODES="${EXPECTED_EPISODES}" \
+if [[ -z "${DATASET_MIX_JSON}" ]]; then
+  DATASET_ROOT="${DATASET_ROOT}" EXPECTED_EPISODES="${EXPECTED_EPISODES}" \
 EXPECTED_FRAMES="${EXPECTED_FRAMES}" EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM}" \
 EXPECTED_FPS="${EXPECTED_FPS}" EXPECTED_ROBOT_TYPE="${EXPECTED_ROBOT_TYPE}" \
 EXPECTED_CAMERAS="${EXPECTED_CAMERAS}" "${PYTHON}" - <<'PY'
@@ -535,6 +611,7 @@ expected_cameras = set(os.environ["EXPECTED_CAMERAS"].split(","))
 assert actual_cameras == expected_cameras, (actual_cameras, expected_cameras)
 print("Dataset validation passed:", info["total_episodes"], info["total_frames"], info["features"].keys())
 PY
+fi
 
 PIPELINE_PHASE="compute full OpenPI normalization stats"
 NORM_FILE="${ASSETS_BASE_DIR}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
@@ -574,6 +651,7 @@ cat >"${MANIFEST}" <<EOF
   "config": "${CONFIG_NAME}",
   "dataset_repo": "${DATASET_REPO}",
   "dataset_root": "${DATASET_ROOT}",
+  "dataset_mix": ${KUAVO_DATASET_MIX_JSON:-null},
   "base_params": "${BASE_PARAMS}",
   "gpu_ids": "${GPU_IDS}",
   "gpu_count": ${GPU_COUNT},
@@ -636,13 +714,13 @@ if [[ "${RESUME}" == "1" ]]; then
   if ! find "${run_dir}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -print -quit 2>/dev/null | grep -q .; then
     PIPELINE_PHASE="download checkpoint for resume"
     mkdir -p "${run_dir}"
-    MODEL_REPO="${MODEL_REPO}" RUN_DIR="${run_dir}" HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
+    RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
       "${PYTHON}" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
 snapshot_download(
-    repo_id=os.environ["MODEL_REPO"],
+    repo_id=os.environ["RESUME_REPO"],
     repo_type="model",
     local_dir=os.environ["RUN_DIR"],
     max_workers=int(os.environ["HF_DOWNLOAD_WORKERS"]),
