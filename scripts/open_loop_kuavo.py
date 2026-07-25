@@ -9,6 +9,7 @@ import dataclasses
 import datetime
 import json
 import logging
+import os
 import pathlib
 import time
 
@@ -47,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", type=pathlib.Path, default=None)
     parser.add_argument("--repo-id", default=None)
+    parser.add_argument(
+        "--assets-base-dir",
+        type=pathlib.Path,
+        default=os.environ.get("OPENPI_ASSETS_BASE_DIR"),
+        help="Directory containing <config-name>/<asset-id>/norm_stats.json.",
+    )
     parser.add_argument("--episodes", type=int, nargs="*", default=[0])
     parser.add_argument("--stride", type=int, default=10)
     parser.add_argument("--max-samples", type=int, default=5)
@@ -149,6 +156,11 @@ def main() -> None:
         raise ValueError("stride, max-samples, and num-steps must all be positive")
 
     train_config = _config.get_config(args.config_name)
+    if args.assets_base_dir is not None:
+        train_config = dataclasses.replace(
+            train_config,
+            assets_base_dir=str(args.assets_base_dir.expanduser().resolve()),
+        )
     data_factory = train_config.data
     dataset_root = (args.dataset_root or pathlib.Path(data_factory.root or "")).expanduser().resolve()
     repo_id = args.repo_id or data_factory.repo_id
@@ -158,9 +170,6 @@ def main() -> None:
         raise ValueError("repo-id is required")
 
     data_config = data_factory.create(train_config.assets_dirs, train_config.model)
-    if data_config.norm_stats is None:
-        raise FileNotFoundError(f"No Kuavo norm stats for {args.config_name}; run scripts/compute_norm_stats.py first")
-
     metadata = LeRobotDatasetMetadata(repo_id, root=dataset_root)
     _data_loader.validate_lerobot_metadata(metadata, data_config)
     checkpoint = checkpoint_root(args.checkpoint)
@@ -170,12 +179,10 @@ def main() -> None:
     logging.info("JAX devices: %s", devices)
     logging.info("Loading %s with config %s", checkpoint, args.config_name)
     load_started = time.perf_counter()
-    policy = policy_config.create_trained_policy(
-        train_config,
-        checkpoint,
-        norm_stats=data_config.norm_stats,
-        sample_kwargs={"num_steps": args.num_steps},
-    )
+    policy_kwargs = {"sample_kwargs": {"num_steps": args.num_steps}}
+    if data_config.norm_stats is not None:
+        policy_kwargs["norm_stats"] = data_config.norm_stats
+    policy = policy_config.create_trained_policy(train_config, checkpoint, **policy_kwargs)
     load_seconds = time.perf_counter() - load_started
     print(f"PASS: loaded JAX Pi0.5 policy from {checkpoint} in {load_seconds:.2f}s")
     print(f"devices: {[str(device) for device in devices]}")

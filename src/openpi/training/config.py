@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -889,7 +890,13 @@ _CONFIGS = [
             repo_id="kuavo_task1",
             root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
             tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
-            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task1"),
+            assets=AssetsConfig(
+                assets_dir=os.environ.get(
+                    "OPENPI_KUAVO_TASK1_ASSETS_DIR",
+                    "./assets/pi05_kuavo",
+                ),
+                asset_id="kuavo_task1",
+            ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/pqssd/pretrained/pi05_local_jax/params"),
         batch_size=1,
@@ -1063,7 +1070,13 @@ _CONFIGS = [
             repo_id="kuavo_task1",
             root="/mnt/pqssd/Real_PQ_3.0/TASK1_SZ_Repaired/lerobot_task1_345",
             tokenizer_path="/mnt/pqssd/pretrained/google/paligemma-3b-pt-224/tokenizer.model",
-            assets=AssetsConfig(assets_dir="./assets/pi05_kuavo", asset_id="kuavo_task1"),
+            assets=AssetsConfig(
+                assets_dir=os.environ.get(
+                    "OPENPI_KUAVO_TASK1_ASSETS_DIR",
+                    "./assets/pi05_kuavo",
+                ),
+                asset_id="kuavo_task1",
+            ),
         ),
         batch_size=1,
         num_workers=0,

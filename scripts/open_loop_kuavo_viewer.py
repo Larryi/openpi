@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import pathlib
 import time
 
@@ -20,6 +22,17 @@ from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
 
 DEFAULT_CHECKPOINT = "/mnt/pqssd/pretrained/pi05_local_jax/params"
+ASSETS_BASE_DIR = os.environ.get("OPENPI_ASSETS_BASE_DIR")
+
+
+def get_config(config_name: str):
+    config = _config.get_config(config_name)
+    if ASSETS_BASE_DIR:
+        config = dataclasses.replace(
+            config,
+            assets_base_dir=str(pathlib.Path(ASSETS_BASE_DIR).expanduser().resolve()),
+        )
+    return config
 
 
 def checkpoint_root(path: str) -> pathlib.Path:
@@ -77,23 +90,23 @@ def make_observation(sample: dict) -> dict:
 
 @st.cache_resource(show_spinner="Loading 12 GB JAX Pi0.5 checkpoint...")
 def load_policy(config_name: str, checkpoint: str, num_steps: int):
-    train_config = _config.get_config(config_name)
+    train_config = get_config(config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
-    if data_config.norm_stats is None:
-        raise FileNotFoundError(f"No norm stats found for {config_name}")
     started = time.perf_counter()
+    policy_kwargs = {"sample_kwargs": {"num_steps": num_steps}}
+    if data_config.norm_stats is not None:
+        policy_kwargs["norm_stats"] = data_config.norm_stats
     policy = policy_config.create_trained_policy(
         train_config,
         checkpoint_root(checkpoint),
-        norm_stats=data_config.norm_stats,
-        sample_kwargs={"num_steps": num_steps},
+        **policy_kwargs,
     )
     return train_config, data_config, policy, time.perf_counter() - started
 
 
 @st.cache_resource(show_spinner="Loading Kuavo LeRobot v3 episode...")
 def load_dataset(config_name: str, dataset_root: str, repo_id: str, episode: int, video_backend: str):
-    train_config = _config.get_config(config_name)
+    train_config = get_config(config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     metadata = LeRobotDatasetMetadata(repo_id, root=dataset_root)
     _data_loader.validate_lerobot_metadata(metadata, data_config)
@@ -130,7 +143,7 @@ def main() -> None:
 
     with st.sidebar:
         config_name = st.selectbox("Kuavo config", ("pi05_kuavo", "pi05_kuavo_task2"))
-        configured = _config.get_config(config_name)
+        configured = get_config(config_name)
         checkpoint = st.text_input("JAX checkpoint", DEFAULT_CHECKPOINT)
         dataset_root = st.text_input("Dataset root", str(configured.data.root))
         repo_id = st.text_input("Repo ID", str(configured.data.repo_id))
