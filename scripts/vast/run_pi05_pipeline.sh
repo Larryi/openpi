@@ -24,7 +24,7 @@ umask 077
 : "${HF_DOWNLOAD_WORKERS:=16}"
 : "${BASE_PARAMS:=gs://openpi-assets/checkpoints/pi05_base/params}"
 : "${PALIGEMMA_REPO:=google/paligemma-3b-pt-224}"
-: "${PYTHON_VERSION:=3.11}"
+: "${OPENPI_PYTHON_VERSION:=3.11}"
 : "${CUDA_NVCC_VERSION:=12.6.85}"
 : "${RUN_ID:=${ROBOT_TASK}_pi05_gpu${GPU_COUNT}_$(date +%Y%m%d_%H%M%S)}"
 : "${AUTO_UPLOAD:=1}"
@@ -210,10 +210,12 @@ TRAIN_LOG="${LOG_DIR}/train.log"
 PIPELINE_LOG="${LOG_DIR}/pipeline.log"
 MANIFEST="${LOG_DIR}/run_manifest.json"
 MIX_RESOLVED_FILE="${LOG_DIR}/dataset_mix.resolved.json"
-if [[ "${PYTHON_VERSION}" != "3.11" ]]; then
-  echo "This frozen OpenPI environment requires PYTHON_VERSION=3.11 because mujoco 2.3.7 has no Python 3.12 wheel" >&2
+if [[ "${OPENPI_PYTHON_VERSION}" != "3.11" ]]; then
+  echo "This frozen OpenPI environment requires OPENPI_PYTHON_VERSION=3.11 because mujoco 2.3.7 has no Python 3.12 wheel" >&2
   exit 2
 fi
+PYTHON_VERSION="${OPENPI_PYTHON_VERSION}"
+export PYTHON_VERSION
 VENV="${WORK_ROOT}/.venv-py311"
 PYTHON="${VENV}/bin/python"
 export UV_PROJECT_ENVIRONMENT="${VENV}"
