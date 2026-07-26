@@ -40,13 +40,20 @@ class CosineDecaySchedule(LRScheduleConfig):
                 raise ValueError("tail_decay_lr must be between 0 and decay_lr")
 
     def create(self) -> optax.Schedule:
-        base_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=self.peak_lr / (self.warmup_steps + 1),
-            peak_value=self.peak_lr,
-            warmup_steps=self.warmup_steps,
-            decay_steps=self.decay_steps,
-            end_value=self.decay_lr,
-        )
+        if self.warmup_steps == 0:
+            base_schedule = optax.cosine_decay_schedule(
+                init_value=self.peak_lr,
+                decay_steps=self.decay_steps,
+                alpha=self.decay_lr / self.peak_lr,
+            )
+        else:
+            base_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=self.peak_lr / (self.warmup_steps + 1),
+                peak_value=self.peak_lr,
+                warmup_steps=self.warmup_steps,
+                decay_steps=self.decay_steps,
+                end_value=self.decay_lr,
+            )
         if self.tail_start_step is None:
             return base_schedule
 

@@ -24,6 +24,21 @@ def test_cosine_decay_schedule_continuous_tail():
     np.testing.assert_allclose(schedule(50_000), 2.5e-7, rtol=1e-5)
 
 
+def test_cosine_decay_schedule_supports_zero_warmup():
+    schedule = optimizer.CosineDecaySchedule(
+        warmup_steps=0,
+        peak_lr=2.5e-6,
+        decay_steps=1,
+        decay_lr=2.5e-6,
+        tail_start_step=45_000,
+        tail_decay_steps=15_000,
+        tail_decay_lr=2.5e-7,
+    ).create()
+
+    np.testing.assert_allclose(schedule(45_000), 2.5e-6, rtol=1e-5)
+    np.testing.assert_allclose(schedule(60_000), 2.5e-7, rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
