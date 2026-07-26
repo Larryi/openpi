@@ -241,7 +241,10 @@ if (( free_gb < MIN_FREE_GB )); then
 fi
 
 export HF_TOKEN HF_XET_HIGH_PERFORMANCE=1 PYTHONUNBUFFERED=1
-export UV_DEFAULT_INDEX="${UV_DEFAULT_INDEX:-https://pypi.org/simple/}"
+: "${VAST_PYPI_INDEX:=https://pypi.org/simple}"
+export UV_DEFAULT_INDEX="${VAST_PYPI_INDEX}"
+export PIP_INDEX_URL="${VAST_PYPI_INDEX}"
+unset PIP_EXTRA_INDEX_URL UV_INDEX_URL UV_EXTRA_INDEX_URL
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-180}"
 export HF_HOME="${HF_HOME:-${WORK_ROOT}/hf_cache}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"

@@ -181,7 +181,7 @@ prompt TRAIN_VIDEO_BACKEND "Video backend (torchcodec/pyav/video_reader)" "torch
 prompt WORK_ROOT "Persistent work root" "/workspace/kuavo_pi05"
 prompt CODE_DIR "OpenPI checkout" "${DEFAULT_CODE_DIR}"
 prompt BASE_PARAMS "Pi0.5 JAX base params" "gs://openpi-assets/checkpoints/pi05_base/params"
-prompt UV_DEFAULT_INDEX "PyPI index" "https://pypi.org/simple"
+prompt VAST_PYPI_INDEX "Vast PyPI index" "https://pypi.org/simple"
 # The frozen dependency graph requires Python 3.11. Vast images often export PYTHON_VERSION=3.12,
 # so the interactive launcher must not inherit that ambient value.
 PYTHON_VERSION="3.11"
@@ -260,7 +260,7 @@ if [[ "${LR_TAIL_ENABLED}" == "1" ]]; then
     "${LR_TAIL_START_STEP}" "${LR_TAIL_DECAY_STEPS}" "${LR_TAIL_DECAY_LR}"
 fi
 printf '  checkpoint keep:    period %s\n' "${KEEP_PERIOD}"
-printf '  Python/PyPI:        %s / %s\n' "${PYTHON_VERSION}" "${UV_DEFAULT_INDEX}"
+printf '  Python/PyPI:        %s / %s\n' "${PYTHON_VERSION}" "${VAST_PYPI_INDEX}"
 printf '  GPUs/FSDP/batch:    %s / %s / %s\n' "${GPU_IDS}" "${FSDP_DEVICES}" "${GLOBAL_BATCH_SIZE}"
 printf '  run:                %s\n' "${RUN_ID}"
 printf '  model repo:         %s (%s)\n' "${MODEL_REPO}" "$([[ "${MODEL_REPO_PRIVATE}" == "1" ]] && echo private || echo PUBLIC)"
@@ -274,7 +274,7 @@ export ROBOT_TASK DATASET_REPO PIPELINE_MODE CONFIRM_FULL_TRAIN
 export GPU_IDS GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE REQUIRE_GPU_NAME MIN_GPU_MEMORY_MB MIN_GPU_FREE_MB
 export CUDA_NVCC_VERSION EMA_DECAY REMAT_POLICY NUM_TRAIN_STEPS SAVE_INTERVAL KEEP_PERIOD NUM_WORKERS TRAIN_VIDEO_BACKEND
 export LR_TAIL_START_STEP LR_TAIL_DECAY_STEPS LR_TAIL_DECAY_LR
-export WORK_ROOT CODE_DIR BASE_PARAMS UV_DEFAULT_INDEX PYTHON_VERSION RUN_ID MODEL_REPO MODEL_REPO_PRIVATE HF_TOKEN
+export WORK_ROOT CODE_DIR BASE_PARAMS VAST_PYPI_INDEX PYTHON_VERSION RUN_ID MODEL_REPO MODEL_REPO_PRIVATE HF_TOKEN
 export WANDB_API_KEY WANDB_PROJECT SERVERCHAN_SENDKEY AUTO_UPLOAD AUTO_STOP_INSTANCE
 export AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE VAST_INSTANCE_ID VAST_API_KEY RESUME OVERWRITE
 
