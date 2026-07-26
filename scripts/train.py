@@ -71,6 +71,48 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
+def _log_camera_views(observation: _model.Observation, *, max_images: int = 5) -> None:
+    """Log model-ready images as visible uint8 previews, together with camera validity."""
+    camera_images: dict[str, np.ndarray] = {}
+    camera_masks: dict[str, np.ndarray] = {}
+    for name, image in observation.images.items():
+        normalized = np.asarray(jax.device_get(image))
+        if not np.isfinite(normalized).all():
+            raise ValueError(f"Camera {name} contains non-finite values")
+
+        masks = np.asarray(jax.device_get(observation.image_masks[name]), dtype=bool)
+        logging.info(
+            "Camera %s: shape=%s normalized_range=[%.3f, %.3f], valid=%d/%d",
+            name,
+            normalized.shape,
+            float(normalized.min()),
+            float(normalized.max()),
+            int(masks.sum()),
+            len(masks),
+        )
+
+        # OpenPI's model input contract is float32 in [-1, 1]. wandb.Image
+        # expects display-space values, so passing the model tensor directly
+        # clips all negative pixels and makes valid views appear black.
+        camera_images[name] = np.rint((np.clip(normalized, -1.0, 1.0) + 1.0) * 127.5).astype(np.uint8)
+        camera_masks[name] = masks
+
+    if not camera_images:
+        logging.warning("No camera views are available in the first training batch")
+        return
+
+    camera_names = tuple(camera_images)
+    sample_count = min(max_images, len(camera_images[camera_names[0]]))
+    previews = []
+    for index in range(sample_count):
+        preview = np.concatenate([camera_images[name][index] for name in camera_names], axis=1)
+        validity = ", ".join(
+            f"{name}={'valid' if camera_masks[name][index] else 'masked'}" for name in camera_names
+        )
+        previews.append(wandb.Image(preview, caption=validity))
+    wandb.log({"camera_views": previews}, step=0)
+
+
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
@@ -231,11 +273,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    _log_camera_views(batch[0])
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
