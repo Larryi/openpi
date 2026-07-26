@@ -38,7 +38,11 @@ umask 077
 : "${VAST_API_KEY:=}"
 : "${SERVERCHAN_SENDKEY:=}"
 : "${MIN_FREE_GB:=50}"
-: "${REQUIRE_GPU_NAME:=A100}"
+: "${REQUIRE_GPU_NAME:=}"
+: "${LR_WARMUP_STEPS:=1000}"
+: "${PEAK_LR:=2.5e-5}"
+: "${LR_DECAY_STEPS:=${NUM_TRAIN_STEPS}}"
+: "${DECAY_LR:=2.5e-6}"
 : "${MIN_GPU_MEMORY_MB:=79000}"
 : "${MIN_GPU_FREE_MB:=70000}"
 : "${EMA_DECAY:=auto}"
@@ -141,6 +145,18 @@ esac
 
 for value in GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE NUM_WORKERS NUM_TRAIN_STEPS SMOKE_STEPS SAVE_INTERVAL LOG_INTERVAL KEEP_PERIOD MIN_FREE_GB MIN_GPU_MEMORY_MB; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || { echo "${value} must be a positive integer" >&2; exit 2; }
+done
+for value in LR_WARMUP_STEPS LR_DECAY_STEPS; do
+  [[ "${!value}" =~ ^[0-9]+$ ]] || {
+    echo "${value} must be a non-negative integer" >&2
+    exit 2
+  }
+done
+for value in PEAK_LR DECAY_LR; do
+  [[ "${!value}" =~ ^[0-9]+([.][0-9]+)?([eE]-?[0-9]+)?$ ]] || {
+    echo "${value} must be a non-negative number" >&2
+    exit 2
+  }
 done
 [[ "${MIN_GPU_FREE_MB}" =~ ^[0-9]+$ ]] || { echo "MIN_GPU_FREE_MB must be a non-negative integer" >&2; exit 2; }
 if [[ "${EMA_DECAY}" == "auto" ]]; then
@@ -663,6 +679,10 @@ cat >"${MANIFEST}" <<EOF
   "remat_policy": "${REMAT_POLICY}",
   "xla_memory_fraction": "${XLA_PYTHON_CLIENT_MEM_FRACTION}",
   "num_train_steps": ${NUM_TRAIN_STEPS},
+  "lr_warmup_steps": ${LR_WARMUP_STEPS},
+  "peak_lr": "${PEAK_LR}",
+  "lr_decay_steps": ${LR_DECAY_STEPS},
+  "decay_lr": "${DECAY_LR}",
   "lr_tail_start_step": "${LR_TAIL_START_STEP}",
   "lr_tail_decay_steps": "${LR_TAIL_DECAY_STEPS}",
   "lr_tail_decay_lr": "${LR_TAIL_DECAY_LR}",
@@ -691,6 +711,12 @@ train_args=(
   --ema-decay "${EMA_DECAY}"
   --model.remat-policy "${REMAT_POLICY}"
   --project-name "${WANDB_PROJECT:-openpi-kuavo}"
+)
+train_args+=(
+  --lr-schedule.warmup-steps "${LR_WARMUP_STEPS}"
+  --lr-schedule.peak-lr "${PEAK_LR}"
+  --lr-schedule.decay-steps "${LR_DECAY_STEPS}"
+  --lr-schedule.decay-lr "${DECAY_LR}"
 )
 if (( lr_tail_value_count == 3 )); then
   train_args+=(
