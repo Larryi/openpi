@@ -324,17 +324,26 @@ upload_run() {
     "${PYTHON}" - <<'PY'
 import os
 from pathlib import Path
+import shutil
 from huggingface_hub import HfApi
 
 api = HfApi(token=os.environ["HF_TOKEN"])
 repo_id = os.environ["MODEL_REPO"]
 private = os.environ["MODEL_REPO_PRIVATE"] == "1"
+run_dir = Path(os.environ["RUN_DIR"])
+# upload_large_folder stores resumable-transfer metadata inside the folder it
+# scans. Interrupted uploads from older huggingface_hub versions can leave
+# malformed metadata that crashes recovery before ignore_patterns is applied.
+upload_cache = run_dir / ".cache" / "huggingface" / "upload"
+if upload_cache.exists():
+    print(f"Removing stale Hugging Face upload cache: {upload_cache}")
+    shutil.rmtree(upload_cache)
 api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
 api.update_repo_settings(repo_id, repo_type="model", private=private)
 api.upload_large_folder(
     repo_id=repo_id,
     repo_type="model",
-    folder_path=os.environ["RUN_DIR"],
+    folder_path=run_dir,
     ignore_patterns=[".cache/**"],
 )
 for local_path in (Path(os.environ["MANIFEST"]), Path(os.environ["LOG_DIR"]) / "train.log"):
@@ -437,7 +446,20 @@ on_exit() {
   set +e
   echo "Pipeline exit rc=${rc}, phase=${PIPELINE_PHASE}"
   if (( rc != 0 && TRAIN_STARTED == 1 )) && [[ "${UPLOAD_STATUS}" == "not_started" ]]; then
-    upload_run
+    if [[ -f "${TRAIN_LOG}" ]]; then
+      echo "Primary training failure (last 80 log lines):" >&2
+      tail -n 80 "${TRAIN_LOG}" >&2
+    fi
+    latest_local_step="$(find "${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${RUN_ID}" \
+      -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null \
+      | sort -n | tail -n 1)"
+    if [[ -n "${OPENPI_RESUME_FROM_STEP:-}" && -n "${latest_local_step}" ]] \
+      && (( latest_local_step <= OPENPI_RESUME_FROM_STEP )); then
+      UPLOAD_STATUS="no_new_checkpoint"
+      echo "Training produced no checkpoint newer than resumed step ${OPENPI_RESUME_FROM_STEP}; skipping fallback upload" >&2
+    else
+      upload_run
+    fi
   fi
   notify_serverchan "${rc}"
   stop_instance "${rc}"
