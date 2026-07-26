@@ -161,6 +161,8 @@ class DataConfig:
     expected_state_names: Sequence[str] | None = None
     expected_action_names: Sequence[str] | None = None
     required_camera_keys: Sequence[str] = ()
+    # Explicit decoder selection avoids environment-dependent TorchCodec defaults.
+    video_backend: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -245,6 +247,7 @@ class DataConfigFactory(abc.ABC):
     root: str | None = None
     # Optional virtual weighted mixture of local or Hub LeRobot datasets.
     lerobot_datasets: Sequence[LeRobotDatasetConfig] = ()
+    video_backend: str | None = None
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -265,6 +268,7 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            video_backend=self.video_backend,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:

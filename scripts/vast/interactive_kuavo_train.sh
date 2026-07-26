@@ -176,7 +176,8 @@ if [[ "${LR_TAIL_ENABLED}" == "1" ]]; then
   prompt LR_TAIL_DECAY_STEPS "Tail duration in steps" "6000"
   prompt LR_TAIL_DECAY_LR "Tail final learning rate" "2.5e-7"
 fi
-prompt NUM_WORKERS "Data-loader workers" "8"
+prompt NUM_WORKERS "Data-loader workers (0 is the stable TorchCodec default)" "0"
+prompt TRAIN_VIDEO_BACKEND "Video backend (torchcodec/pyav/video_reader)" "torchcodec"
 prompt WORK_ROOT "Persistent work root" "/workspace/kuavo_pi05"
 prompt CODE_DIR "OpenPI checkout" "${DEFAULT_CODE_DIR}"
 prompt BASE_PARAMS "Pi0.5 JAX base params" "gs://openpi-assets/checkpoints/pi05_base/params"
@@ -271,7 +272,7 @@ read -r -p "Type START to launch: " confirmation
 
 export ROBOT_TASK DATASET_REPO PIPELINE_MODE CONFIRM_FULL_TRAIN
 export GPU_IDS GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE REQUIRE_GPU_NAME MIN_GPU_MEMORY_MB MIN_GPU_FREE_MB
-export CUDA_NVCC_VERSION EMA_DECAY REMAT_POLICY NUM_TRAIN_STEPS SAVE_INTERVAL KEEP_PERIOD NUM_WORKERS
+export CUDA_NVCC_VERSION EMA_DECAY REMAT_POLICY NUM_TRAIN_STEPS SAVE_INTERVAL KEEP_PERIOD NUM_WORKERS TRAIN_VIDEO_BACKEND
 export LR_TAIL_START_STEP LR_TAIL_DECAY_STEPS LR_TAIL_DECAY_LR
 export WORK_ROOT CODE_DIR BASE_PARAMS UV_DEFAULT_INDEX PYTHON_VERSION RUN_ID MODEL_REPO MODEL_REPO_PRIVATE HF_TOKEN
 export WANDB_API_KEY WANDB_PROJECT SERVERCHAN_SENDKEY AUTO_UPLOAD AUTO_STOP_INSTANCE

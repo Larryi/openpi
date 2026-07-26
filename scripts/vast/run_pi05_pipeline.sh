@@ -15,7 +15,9 @@ umask 077
 : "${FSDP_DEVICES:=${GPU_COUNT}}"
 : "${SMOKE_GLOBAL_BATCH_SIZE:=${GPU_COUNT}}"
 : "${TRAIN_GLOBAL_BATCH_SIZE:=32}"
-: "${NUM_WORKERS:=8}"
+: "${NUM_WORKERS:=0}"
+: "${TRAIN_VIDEO_BACKEND:=torchcodec}"
+: "${ALLOW_UNSAFE_VIDEO_WORKERS:=0}"
 : "${NORM_NUM_WORKERS:=0}"
 : "${NORM_BATCH_SIZE:=32}"
 : "${NORM_REPO:=${MODEL_REPO}}"
@@ -56,12 +58,16 @@ umask 077
 : "${LR_TAIL_DECAY_LR:=}"
 : "${DATASET_MIX_JSON:=}"
 
-for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE; do
+for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE ALLOW_UNSAFE_VIDEO_WORKERS; do
   [[ "${!value}" == "0" || "${!value}" == "1" ]] || {
     echo "${value} must be 0 or 1, got ${!value}" >&2
     exit 2
   }
 done
+case "${TRAIN_VIDEO_BACKEND}" in
+  torchcodec|pyav|video_reader) ;;
+  *) echo "TRAIN_VIDEO_BACKEND must be torchcodec, pyav, or video_reader" >&2; exit 2 ;;
+esac
 
 lr_tail_value_count=0
 for value in LR_TAIL_START_STEP LR_TAIL_DECAY_STEPS LR_TAIL_DECAY_LR; do
@@ -147,9 +153,20 @@ case "${ROBOT_TASK}" in
     ;;
 esac
 
-for value in GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE NUM_WORKERS NUM_TRAIN_STEPS SMOKE_STEPS SAVE_INTERVAL LOG_INTERVAL KEEP_PERIOD MIN_FREE_GB MIN_GPU_MEMORY_MB; do
+for value in GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE NUM_TRAIN_STEPS SMOKE_STEPS SAVE_INTERVAL LOG_INTERVAL KEEP_PERIOD MIN_FREE_GB MIN_GPU_MEMORY_MB; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || { echo "${value} must be a positive integer" >&2; exit 2; }
 done
+[[ "${NUM_WORKERS}" =~ ^[0-9]+$ ]] || {
+  echo "NUM_WORKERS must be a non-negative integer" >&2
+  exit 2
+}
+if [[ "${TRAIN_VIDEO_BACKEND}" == "torchcodec" && "${NUM_WORKERS}" != "0" ]]; then
+  if [[ "${ALLOW_UNSAFE_VIDEO_WORKERS}" != "1" ]]; then
+    echo "TorchCodec multiprocessing has caused native worker segfaults; forcing NUM_WORKERS=0." >&2
+    echo "Set ALLOW_UNSAFE_VIDEO_WORKERS=1 only to run an explicit throughput experiment." >&2
+    NUM_WORKERS=0
+  fi
+fi
 [[ "${NORM_NUM_WORKERS}" =~ ^[0-9]+$ ]] || {
   echo "NORM_NUM_WORKERS must be a non-negative integer" >&2
   exit 2
@@ -774,6 +791,8 @@ cat >"${MANIFEST}" <<EOF
   "gpu_count": ${GPU_COUNT},
   "fsdp_devices": ${FSDP_DEVICES},
   "global_batch_size": ${GLOBAL_BATCH_SIZE},
+  "num_workers": ${NUM_WORKERS},
+  "train_video_backend": "${TRAIN_VIDEO_BACKEND}",
   "ema_decay": "${EMA_DECAY}",
   "remat_policy": "${REMAT_POLICY}",
   "xla_memory_fraction": "${XLA_PYTHON_CLIENT_MEM_FRACTION}",
@@ -795,6 +814,7 @@ train_args=(
   "${CONFIG_NAME}"
   --exp-name "${RUN_ID}"
   --data.root "${DATASET_ROOT}"
+  --data.video-backend "${TRAIN_VIDEO_BACKEND}"
   --data.tokenizer-path "${TOKENIZER_PATH}"
   --data.assets.assets-dir "${ASSETS_BASE_DIR}/${CONFIG_NAME}"
   --data.assets.asset-id "${NORM_ASSET_ID}"
