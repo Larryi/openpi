@@ -676,6 +676,7 @@ fi
 PIPELINE_PHASE="compute full OpenPI normalization stats"
 NORM_FILE="${ASSETS_BASE_DIR}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
 NORM_CACHE_PATH="${NORM_CACHE_PREFIX}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
+echo "OpenPI norm cache target: ${NORM_REPO}/${NORM_CACHE_PATH}"
 if [[ ! -s "${NORM_FILE}" ]]; then
   NORM_REPO="${NORM_REPO}" NORM_CACHE_PATH="${NORM_CACHE_PATH}" \
   NORM_FILE="${NORM_FILE}" "${PYTHON}" - <<'PY'
