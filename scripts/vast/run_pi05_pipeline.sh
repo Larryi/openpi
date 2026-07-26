@@ -922,22 +922,41 @@ else
 fi
 run_dir="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${RUN_ID}"
 if [[ "${RESUME}" == "1" ]]; then
-  if ! find "${run_dir}" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -print -quit 2>/dev/null | grep -q .; then
+  resume_complete_marker="${run_dir}/.kuavo_hf_resume_complete"
+  if [[ ! -f "${resume_complete_marker}" ]] \
+    || [[ "$(cat "${resume_complete_marker}" 2>/dev/null)" != "${RESUME_REPO}" ]]; then
     PIPELINE_PHASE="download checkpoint for resume"
-    mkdir -p "${run_dir}"
-    RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
+    resume_staging_dir="${run_dir}.hf-download"
+    mkdir -p "${resume_staging_dir}"
+    echo "Downloading resume checkpoint into staging directory: ${resume_staging_dir}"
+    echo "A file-count progress bar can pause while one large checkpoint shard is still transferring."
+    RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" RESUME_STAGING_DIR="${resume_staging_dir}" \
+      HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
       "${PYTHON}" - <<'PY'
 import os
+from pathlib import Path
+import shutil
 from huggingface_hub import snapshot_download
 
 snapshot_download(
     repo_id=os.environ["RESUME_REPO"],
     repo_type="model",
-    local_dir=os.environ["RUN_DIR"],
+    local_dir=os.environ["RESUME_STAGING_DIR"],
     max_workers=int(os.environ["HF_DOWNLOAD_WORKERS"]),
     token=os.environ["HF_TOKEN"],
 )
+staging = Path(os.environ["RESUME_STAGING_DIR"])
+(staging / ".kuavo_hf_resume_complete").write_text(
+    os.environ["RESUME_REPO"], encoding="utf-8"
+)
+run_dir = Path(os.environ["RUN_DIR"])
+if run_dir.exists():
+    shutil.rmtree(run_dir)
+staging.replace(run_dir)
+print(f"Resume checkpoint download finalized atomically: {run_dir}")
 PY
+  else
+    echo "Using completed resume checkpoint: ${run_dir}"
   fi
   train_args+=(--resume)
 else
