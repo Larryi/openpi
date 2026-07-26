@@ -16,6 +16,8 @@ umask 077
 : "${SMOKE_GLOBAL_BATCH_SIZE:=${GPU_COUNT}}"
 : "${TRAIN_GLOBAL_BATCH_SIZE:=32}"
 : "${NUM_WORKERS:=8}"
+: "${NORM_NUM_WORKERS:=0}"
+: "${NORM_BATCH_SIZE:=32}"
 : "${NUM_TRAIN_STEPS:=30000}"
 : "${SMOKE_STEPS:=10}"
 : "${SAVE_INTERVAL:=1000}"
@@ -146,6 +148,14 @@ esac
 for value in GPU_COUNT FSDP_DEVICES GLOBAL_BATCH_SIZE NUM_WORKERS NUM_TRAIN_STEPS SMOKE_STEPS SAVE_INTERVAL LOG_INTERVAL KEEP_PERIOD MIN_FREE_GB MIN_GPU_MEMORY_MB; do
   [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || { echo "${value} must be a positive integer" >&2; exit 2; }
 done
+[[ "${NORM_NUM_WORKERS}" =~ ^[0-9]+$ ]] || {
+  echo "NORM_NUM_WORKERS must be a non-negative integer" >&2
+  exit 2
+}
+[[ "${NORM_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "NORM_BATCH_SIZE must be a positive integer" >&2
+  exit 2
+}
 for value in LR_WARMUP_STEPS LR_DECAY_STEPS; do
   [[ "${!value}" =~ ^[0-9]+$ ]] || {
     echo "${value} must be a non-negative integer" >&2
@@ -643,13 +653,22 @@ fi
 PIPELINE_PHASE="compute full OpenPI normalization stats"
 NORM_FILE="${ASSETS_BASE_DIR}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
 if [[ ! -s "${NORM_FILE}" ]]; then
-  "${PYTHON}" scripts/compute_norm_stats.py \
-    --config-name "${CONFIG_NAME}" \
-    --dataset-root "${DATASET_ROOT}" \
-    --tokenizer-path "${TOKENIZER_PATH}" \
-    --assets-base-dir "${ASSETS_BASE_DIR}" \
-    --batch-size 32 \
-    --num-workers "${NUM_WORKERS}"
+  norm_args=(
+    --config-name "${CONFIG_NAME}"
+    --dataset-root "${DATASET_ROOT}"
+    --tokenizer-path "${TOKENIZER_PATH}"
+    --assets-base-dir "${ASSETS_BASE_DIR}"
+    --batch-size "${NORM_BATCH_SIZE}"
+    --num-workers "${NORM_NUM_WORKERS}"
+  )
+  if ! "${PYTHON}" scripts/compute_norm_stats.py "${norm_args[@]}"; then
+    if (( NORM_NUM_WORKERS == 0 )); then
+      exit 1
+    fi
+    echo "Parallel norm-stat loading failed; retrying with num_workers=0" >&2
+    norm_args[-1]="0"
+    "${PYTHON}" scripts/compute_norm_stats.py "${norm_args[@]}"
+  fi
 fi
 [[ -s "${NORM_FILE}" ]] || { echo "Missing norm stats: ${NORM_FILE}" >&2; exit 5; }
 NORM_FILE="${NORM_FILE}" EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM}" "${PYTHON}" - <<'PY'
