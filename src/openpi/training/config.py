@@ -74,7 +74,9 @@ class LeRobotDatasetConfig:
     repo_id: str
     root: str | None = None
     weight: float = 1.0
-    episodes: Sequence[int] | None = None
+    # Use a concrete variadic tuple so Tyro can serialize tuple defaults while
+    # constructing the overridable CLI for every registered training config.
+    episodes: tuple[int, ...] | None = None
 
 
 def _kuavo_mix_payload() -> list[dict]:
