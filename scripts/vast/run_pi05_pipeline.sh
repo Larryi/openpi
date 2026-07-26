@@ -31,6 +31,10 @@ umask 077
 : "${LOG_INTERVAL:=20}"
 : "${KEEP_PERIOD:=1000000000}"
 : "${HF_DOWNLOAD_WORKERS:=16}"
+: "${RESUME_HF_DOWNLOAD_WORKERS:=4}"
+: "${RESUME_DOWNLOAD_TIMEOUT_SECONDS:=120}"
+: "${RESUME_DOWNLOAD_ATTEMPT_SECONDS:=1800}"
+: "${RESUME_DOWNLOAD_RETRIES:=5}"
 : "${BASE_PARAMS:=gs://openpi-assets/checkpoints/pi05_base/params}"
 : "${PALIGEMMA_REPO:=google/paligemma-3b-pt-224}"
 : "${OPENPI_PYTHON_VERSION:=3.11}"
@@ -64,6 +68,12 @@ umask 077
 for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE; do
   [[ "${!value}" == "0" || "${!value}" == "1" ]] || {
     echo "${value} must be 0 or 1, got ${!value}" >&2
+    exit 2
+  }
+done
+for value in RESUME_HF_DOWNLOAD_WORKERS RESUME_DOWNLOAD_TIMEOUT_SECONDS RESUME_DOWNLOAD_ATTEMPT_SECONDS RESUME_DOWNLOAD_RETRIES; do
+  [[ "${!value}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "${value} must be a positive integer, got ${!value}" >&2
     exit 2
   }
 done
@@ -930,9 +940,14 @@ if [[ "${RESUME}" == "1" ]]; then
     mkdir -p "${resume_staging_dir}"
     echo "Downloading resume checkpoint into staging directory: ${resume_staging_dir}"
     echo "A file-count progress bar can pause while one large checkpoint shard is still transferring."
-    RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" RESUME_STAGING_DIR="${resume_staging_dir}" \
-      HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS}" \
-      "${PYTHON}" - <<'PY'
+    download_resume_checkpoint() {
+      RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" RESUME_STAGING_DIR="${resume_staging_dir}" \
+        RESUME_HF_DOWNLOAD_WORKERS="${RESUME_HF_DOWNLOAD_WORKERS}" \
+        timeout --signal=TERM "${RESUME_DOWNLOAD_ATTEMPT_SECONDS}" \
+        env HF_HUB_DISABLE_XET=1 \
+          HF_HUB_DOWNLOAD_TIMEOUT="${RESUME_DOWNLOAD_TIMEOUT_SECONDS}" \
+          HF_HUB_ETAG_TIMEOUT=30 \
+          "${PYTHON}" - <<'PY'
 import os
 from pathlib import Path
 import shutil
@@ -942,7 +957,7 @@ snapshot_download(
     repo_id=os.environ["RESUME_REPO"],
     repo_type="model",
     local_dir=os.environ["RESUME_STAGING_DIR"],
-    max_workers=int(os.environ["HF_DOWNLOAD_WORKERS"]),
+    max_workers=int(os.environ["RESUME_HF_DOWNLOAD_WORKERS"]),
     token=os.environ["HF_TOKEN"],
 )
 staging = Path(os.environ["RESUME_STAGING_DIR"])
@@ -955,6 +970,9 @@ if run_dir.exists():
 staging.replace(run_dir)
 print(f"Resume checkpoint download finalized atomically: {run_dir}")
 PY
+    }
+    echo "Resume download transport: HTTP (Xet disabled), workers=${RESUME_HF_DOWNLOAD_WORKERS}, attempt timeout=${RESUME_DOWNLOAD_ATTEMPT_SECONDS}s"
+    retry "${RESUME_DOWNLOAD_RETRIES}" download_resume_checkpoint
   else
     echo "Using completed resume checkpoint: ${run_dir}"
   fi
