@@ -24,6 +24,28 @@ class RemoveStrings(transforms.DataTransformFn):
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
 
 
+class StateActionOnlyInputs(transforms.DataTransformFn):
+    """Extract normalization inputs without touching image or prompt features."""
+
+    def __call__(self, x: dict) -> dict:
+        return {
+            "state": np.asarray(x["observation.state"], dtype=np.float32),
+            "actions": np.asarray(x["action"], dtype=np.float32),
+        }
+
+
+def disable_video_decoding(dataset) -> None:
+    """Disable LeRobot video reads recursively for state/action-only statistics."""
+    while isinstance(dataset, _data_loader.TransformedDataset):
+        dataset = dataset.dataset
+    if isinstance(dataset, _data_loader.WeightedLeRobotDataset):
+        for child in dataset.datasets:
+            disable_video_decoding(child)
+        return
+    if hasattr(dataset, "_query_videos"):
+        dataset._query_videos = lambda query_timestamps, ep_idx: {}
+
+
 def create_torch_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -31,25 +53,32 @@ def create_torch_dataloader(
     model_config: _model.BaseModelConfig,
     num_workers: int,
     max_frames: int | None = None,
+    state_action_only: bool = False,
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    if state_action_only:
+        disable_video_decoding(dataset)
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
     else:
         num_batches = len(dataset) // batch_size
     num_samples = num_batches * batch_size
     sampler = _data_loader.create_weighted_sampler(dataset, num_samples=num_samples)
-    dataset = _data_loader.TransformedDataset(
-        dataset,
+    transforms_to_apply = (
         [
+            StateActionOnlyInputs(),
+            *data_config.data_transforms.inputs[1:],
+        ]
+        if state_action_only
+        else [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
-        ],
+        ]
     )
+    dataset = _data_loader.TransformedDataset(dataset, transforms_to_apply)
     shuffle = sampler is None and max_frames is not None and max_frames < len(dataset)
     data_loader = _data_loader.TorchDataLoader(
         dataset,
@@ -99,6 +128,7 @@ def main(
     assets_base_dir: str | None = None,
     batch_size: int | None = None,
     num_workers: int | None = None,
+    state_action_only: bool = False,
 ):
     config = _config.get_config(config_name)
     if assets_base_dir is not None:
@@ -124,7 +154,13 @@ def main(
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            config.num_workers,
+            max_frames,
+            state_action_only,
         )
 
     keys = ["state", "actions"]

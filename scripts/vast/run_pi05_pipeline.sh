@@ -18,6 +18,8 @@ umask 077
 : "${NUM_WORKERS:=8}"
 : "${NORM_NUM_WORKERS:=0}"
 : "${NORM_BATCH_SIZE:=32}"
+: "${NORM_REPO:=${MODEL_REPO}}"
+: "${NORM_CACHE_PREFIX:=openpi_norm}"
 : "${NUM_TRAIN_STEPS:=30000}"
 : "${SMOKE_STEPS:=10}"
 : "${SAVE_INTERVAL:=1000}"
@@ -524,7 +526,7 @@ import json
 import os
 from pathlib import Path
 import re
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, snapshot_download
 
 sources = json.loads(os.environ["DATASET_MIX_JSON"])
 if not isinstance(sources, list) or not sources:
@@ -535,6 +537,7 @@ if total_weight <= 0 or any(float(source["weight"]) <= 0 for source in sources):
 root = Path(os.environ["WORK_ROOT"]) / "datasets" / "mixture"
 expected_cameras = set(os.environ["EXPECTED_CAMERAS"].split(","))
 resolved = []
+api = HfApi(token=os.environ["HF_TOKEN"])
 for index, source in enumerate(sources, 1):
     repo_id = str(source["repo_id"])
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", repo_id)
@@ -566,6 +569,7 @@ for index, source in enumerate(sources, 1):
         "repo_id": repo_id,
         "root": str(local_root),
         "weight": float(source["weight"]) / total_weight,
+        "revision": api.dataset_info(repo_id).sha,
     })
 
 output = Path(os.environ["MIX_RESOLVED_FILE"])
@@ -597,6 +601,15 @@ snapshot_download(
     token=os.environ["HF_TOKEN"],
 )
 PY
+  dataset_revision="$(
+    DATASET_REPO="${DATASET_REPO}" "${PYTHON}" - <<'PY'
+import os
+from huggingface_hub import HfApi
+print(HfApi(token=os.environ["HF_TOKEN"]).dataset_info(os.environ["DATASET_REPO"]).sha[:10])
+PY
+  )"
+  NORM_ASSET_ID="${NORM_ASSET_ID}_rev_${dataset_revision}"
+  export KUAVO_MIX_ASSET_ID="${NORM_ASSET_ID}"
 fi
 if [[ ! -s "${TOKENIZER_PATH}" ]]; then
   PALIGEMMA_REPO="${PALIGEMMA_REPO}" TOKENIZER_DIR="${TOKENIZER_DIR}" "${PYTHON}" - <<'PY'
@@ -652,6 +665,31 @@ fi
 
 PIPELINE_PHASE="compute full OpenPI normalization stats"
 NORM_FILE="${ASSETS_BASE_DIR}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
+NORM_CACHE_PATH="${NORM_CACHE_PREFIX}/${CONFIG_NAME}/${NORM_ASSET_ID}/norm_stats.json"
+if [[ ! -s "${NORM_FILE}" ]]; then
+  NORM_REPO="${NORM_REPO}" NORM_CACHE_PATH="${NORM_CACHE_PATH}" \
+  NORM_FILE="${NORM_FILE}" "${PYTHON}" - <<'PY'
+import os
+from pathlib import Path
+import shutil
+from huggingface_hub import hf_hub_download
+
+try:
+    cached = hf_hub_download(
+        repo_id=os.environ["NORM_REPO"],
+        repo_type="model",
+        filename=os.environ["NORM_CACHE_PATH"],
+        token=os.environ["HF_TOKEN"],
+    )
+except Exception:
+    print("No matching OpenPI norm cache; computing it once.")
+else:
+    destination = Path(os.environ["NORM_FILE"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(cached, destination)
+    print(f"Reused OpenPI norm cache: {os.environ['NORM_REPO']}/{os.environ['NORM_CACHE_PATH']}")
+PY
+fi
 if [[ ! -s "${NORM_FILE}" ]]; then
   norm_args=(
     --config-name "${CONFIG_NAME}"
@@ -660,6 +698,7 @@ if [[ ! -s "${NORM_FILE}" ]]; then
     --assets-base-dir "${ASSETS_BASE_DIR}"
     --batch-size "${NORM_BATCH_SIZE}"
     --num-workers "${NORM_NUM_WORKERS}"
+    --state-action-only
   )
   if ! "${PYTHON}" scripts/compute_norm_stats.py "${norm_args[@]}"; then
     if (( NORM_NUM_WORKERS == 0 )); then
@@ -669,6 +708,27 @@ if [[ ! -s "${NORM_FILE}" ]]; then
     norm_args[-1]="0"
     "${PYTHON}" scripts/compute_norm_stats.py "${norm_args[@]}"
   fi
+  NORM_REPO="${NORM_REPO}" NORM_CACHE_PATH="${NORM_CACHE_PATH}" \
+  NORM_FILE="${NORM_FILE}" MODEL_REPO_PRIVATE="${MODEL_REPO_PRIVATE}" \
+  "${PYTHON}" - <<'PY'
+import os
+from huggingface_hub import HfApi
+
+api = HfApi(token=os.environ["HF_TOKEN"])
+api.create_repo(
+    os.environ["NORM_REPO"],
+    repo_type="model",
+    private=os.environ["MODEL_REPO_PRIVATE"] == "1",
+    exist_ok=True,
+)
+api.upload_file(
+    repo_id=os.environ["NORM_REPO"],
+    repo_type="model",
+    path_or_fileobj=os.environ["NORM_FILE"],
+    path_in_repo=os.environ["NORM_CACHE_PATH"],
+)
+print(f"Uploaded reusable OpenPI norm cache: {os.environ['NORM_REPO']}/{os.environ['NORM_CACHE_PATH']}")
+PY
 fi
 [[ -s "${NORM_FILE}" ]] || { echo "Missing norm stats: ${NORM_FILE}" >&2; exit 5; }
 NORM_FILE="${NORM_FILE}" EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM}" "${PYTHON}" - <<'PY'
