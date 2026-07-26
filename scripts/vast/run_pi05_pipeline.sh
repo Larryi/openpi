@@ -14,10 +14,13 @@ umask 077
 : "${GPU_COUNT:=4}"
 : "${FSDP_DEVICES:=${GPU_COUNT}}"
 : "${SMOKE_GLOBAL_BATCH_SIZE:=${GPU_COUNT}}"
-: "${TRAIN_GLOBAL_BATCH_SIZE:=32}"
-: "${NUM_WORKERS:=0}"
+: "${TRAIN_GLOBAL_BATCH_SIZE:=}"
+: "${NUM_WORKERS:=8}"
 : "${TRAIN_VIDEO_BACKEND:=torchcodec}"
-: "${ALLOW_UNSAFE_VIDEO_WORKERS:=0}"
+: "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
+: "${TORCH_VERSION:=2.11.0+cu128}"
+: "${TORCHVISION_VERSION:=0.26.0+cu128}"
+: "${TORCHCODEC_VERSION:=0.11.1}"
 : "${NORM_NUM_WORKERS:=0}"
 : "${NORM_BATCH_SIZE:=32}"
 : "${NORM_REPO:=${MODEL_REPO}}"
@@ -52,13 +55,13 @@ umask 077
 : "${MIN_GPU_MEMORY_MB:=79000}"
 : "${MIN_GPU_FREE_MB:=70000}"
 : "${EMA_DECAY:=auto}"
-: "${REMAT_POLICY:=nothing_saveable}"
+: "${REMAT_POLICY:=auto}"
 : "${LR_TAIL_START_STEP:=}"
 : "${LR_TAIL_DECAY_STEPS:=}"
 : "${LR_TAIL_DECAY_LR:=}"
 : "${DATASET_MIX_JSON:=}"
 
-for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE ALLOW_UNSAFE_VIDEO_WORKERS; do
+for value in MODEL_REPO_PRIVATE AUTO_UPLOAD OVERWRITE RESUME AUTO_STOP_INSTANCE AUTO_STOP_ON_FAILURE AUTO_STOP_ON_UPLOAD_FAILURE; do
   [[ "${!value}" == "0" || "${!value}" == "1" ]] || {
     echo "${value} must be 0 or 1, got ${!value}" >&2
     exit 2
@@ -94,7 +97,16 @@ fi
 
 case "${PIPELINE_MODE}" in
   smoke) GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${SMOKE_GLOBAL_BATCH_SIZE}}" ;;
-  train) GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${TRAIN_GLOBAL_BATCH_SIZE}}" ;;
+  train)
+    if [[ -z "${TRAIN_GLOBAL_BATCH_SIZE}" ]]; then
+      if (( GPU_COUNT == 1 )); then
+        TRAIN_GLOBAL_BATCH_SIZE=16
+      else
+        TRAIN_GLOBAL_BATCH_SIZE=32
+      fi
+    fi
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${TRAIN_GLOBAL_BATCH_SIZE}}"
+    ;;
   *) echo "PIPELINE_MODE must be smoke or train, got ${PIPELINE_MODE}" >&2; exit 2 ;;
 esac
 
@@ -160,13 +172,6 @@ done
   echo "NUM_WORKERS must be a non-negative integer" >&2
   exit 2
 }
-if [[ "${TRAIN_VIDEO_BACKEND}" == "torchcodec" && "${NUM_WORKERS}" != "0" ]]; then
-  if [[ "${ALLOW_UNSAFE_VIDEO_WORKERS}" != "1" ]]; then
-    echo "TorchCodec multiprocessing has caused native worker segfaults; forcing NUM_WORKERS=0." >&2
-    echo "Set ALLOW_UNSAFE_VIDEO_WORKERS=1 only to run an explicit throughput experiment." >&2
-    NUM_WORKERS=0
-  fi
-fi
 [[ "${NORM_NUM_WORKERS}" =~ ^[0-9]+$ ]] || {
   echo "NORM_NUM_WORKERS must be a non-negative integer" >&2
   exit 2
@@ -196,6 +201,13 @@ fi
 if [[ "${EMA_DECAY}" != "None" && ! "${EMA_DECAY}" =~ ^0(\.[0-9]+)?$ ]]; then
   echo "EMA_DECAY must be auto, None, or a value in [0, 1), got ${EMA_DECAY}" >&2
   exit 2
+fi
+if [[ "${REMAT_POLICY}" == "auto" ]]; then
+  if (( GPU_COUNT == 1 )); then
+    REMAT_POLICY="dots_with_no_batch_dims_saveable"
+  else
+    REMAT_POLICY="nothing_saveable"
+  fi
 fi
 case "${REMAT_POLICY}" in
   nothing_saveable|dots_with_no_batch_dims_saveable|none) ;;
@@ -440,7 +452,15 @@ if [[ ! -x "${PYTHON}" ]]; then
 fi
 "${PYTHON}" -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version'
 cd "${CODE_DIR}"
-retry 3 uv sync --python "${PYTHON}" --frozen --no-group dev
+environment_digest="$(
+  sha256sum pyproject.toml uv.lock | sha256sum | cut -d' ' -f1
+)"
+environment_stamp="${VENV}/.kuavo-environment-${environment_digest}"
+if [[ ! -f "${environment_stamp}" ]]; then
+  retry 3 uv sync --python "${PYTHON}" --frozen --no-group dev
+else
+  echo "Reusing verified OpenPI environment: ${environment_stamp}"
+fi
 # The frozen lock currently provides CUDA NVCC 12.9. Do not downgrade it: CUDA 12.8+
 # is required to compile for Blackwell. An explicit version remains available for
 # reproducing an older platform, and is validated against the selected GPU below.
@@ -448,6 +468,18 @@ if [[ "${CUDA_NVCC_VERSION}" != "auto" ]]; then
   retry 3 uv pip install --python "${PYTHON}" \
     "nvidia-cuda-nvcc-cu12==${CUDA_NVCC_VERSION}"
 fi
+# The repository lock still carries the older Torch 2.7 / TorchCodec 0.4 pair.
+# The proven local Kuavo training environment uses the CUDA 12.8 Blackwell
+# wheels below; TorchCodec 0.11 fixes the spawned-worker decoder crashes and
+# restores the original eight-worker input throughput.
+retry 3 uv pip install --python "${PYTHON}" \
+  --index-url "${PYTORCH_INDEX_URL}" \
+  "torch==${TORCH_VERSION}" \
+  "torchvision==${TORCHVISION_VERSION}"
+retry 3 uv pip install --python "${PYTHON}" \
+  --index-url "https://pypi.org/simple" \
+  --no-deps \
+  "torchcodec==${TORCHCODEC_VERSION}"
 CUDA_NVCC_VERSION="$(
   "${PYTHON}" -c \
     'from importlib.metadata import version; print(version("nvidia-cuda-nvcc-cu12"))'
@@ -459,12 +491,15 @@ from importlib.metadata import version
 expected = {
     "huggingface-hub": "0.32.3",
     "transformers": "4.53.2",
-    "torchcodec": "0.4.0",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "torchcodec": "0.11.1",
 }
 actual = {package: version(package) for package in expected}
 assert actual == expected, (actual, expected)
 print("Frozen Python dependency versions passed:", actual)
 PY
+touch "${environment_stamp}"
 
 PIPELINE_PHASE="CUDA and topology preflight"
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -793,6 +828,9 @@ cat >"${MANIFEST}" <<EOF
   "global_batch_size": ${GLOBAL_BATCH_SIZE},
   "num_workers": ${NUM_WORKERS},
   "train_video_backend": "${TRAIN_VIDEO_BACKEND}",
+  "torch_version": "${TORCH_VERSION}",
+  "torchvision_version": "${TORCHVISION_VERSION}",
+  "torchcodec_version": "${TORCHCODEC_VERSION}",
   "ema_decay": "${EMA_DECAY}",
   "remat_policy": "${REMAT_POLICY}",
   "xla_memory_fraction": "${XLA_PYTHON_CLIENT_MEM_FRACTION}",

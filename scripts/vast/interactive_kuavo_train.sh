@@ -176,7 +176,7 @@ if [[ "${LR_TAIL_ENABLED}" == "1" ]]; then
   prompt LR_TAIL_DECAY_STEPS "Tail duration in steps" "6000"
   prompt LR_TAIL_DECAY_LR "Tail final learning rate" "2.5e-7"
 fi
-prompt NUM_WORKERS "Data-loader workers (0 is the stable TorchCodec default)" "0"
+prompt NUM_WORKERS "Data-loader workers" "8"
 prompt TRAIN_VIDEO_BACKEND "Video backend (torchcodec/pyav/video_reader)" "torchcodec"
 prompt WORK_ROOT "Persistent work root" "/workspace/kuavo_pi05"
 prompt CODE_DIR "OpenPI checkout" "${DEFAULT_CODE_DIR}"
