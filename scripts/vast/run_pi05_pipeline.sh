@@ -4,7 +4,7 @@ umask 077
 
 : "${HF_TOKEN:?Set HF_TOKEN with private dataset read and model write access}"
 : "${MODEL_REPO:?Set the Hugging Face model repository}"
-: "${MODEL_REPO_PRIVATE:=1}"
+: "${MODEL_REPO_PRIVATE:=0}"
 : "${ROBOT_TASK:=${KUAVO_TASK:-task1}}"
 : "${WORK_ROOT:=/workspace/kuavo_pi05}"
 : "${CODE_DIR:=${WORK_ROOT}/openpi-kuavo}"
@@ -335,6 +335,7 @@ api.upload_large_folder(
     repo_id=repo_id,
     repo_type="model",
     folder_path=os.environ["RUN_DIR"],
+    ignore_patterns=[".cache/**"],
 )
 for local_path in (Path(os.environ["MANIFEST"]), Path(os.environ["LOG_DIR"]) / "train.log"):
     if local_path.is_file():
