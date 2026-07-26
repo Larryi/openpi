@@ -9,6 +9,7 @@ import dataclasses
 import pathlib
 
 import numpy as np
+import torch
 import tqdm
 import tyro
 
@@ -44,6 +45,101 @@ def disable_video_decoding(dataset) -> None:
         return
     if hasattr(dataset, "_query_videos"):
         dataset._query_videos = lambda query_timestamps, ep_idx: {}
+
+
+def _unwrap_dataset(dataset):
+    while isinstance(dataset, _data_loader.TransformedDataset):
+        dataset = dataset.dataset
+    return dataset
+
+
+def _numpy_column(dataset, key: str) -> np.ndarray:
+    dataset._ensure_hf_dataset_loaded()
+    values = dataset.hf_dataset[key]
+    if isinstance(values, np.ndarray):
+        return values
+    return np.stack([np.asarray(value) for value in values])
+
+
+def compute_state_action_stats(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    chunk_size: int = 4096,
+    max_frames: int | None = None,
+) -> dict[str, normalize.NormStats]:
+    """Vectorized Kuavo norm path that never enters LeRobot ``__getitem__``."""
+    dataset = _unwrap_dataset(
+        _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    )
+    if isinstance(dataset, _data_loader.WeightedLeRobotDataset):
+        sources = dataset.datasets
+        generator = torch.Generator()
+        generator.manual_seed(0)
+        selected = torch.multinomial(
+            dataset.sampling_weights,
+            num_samples=min(len(dataset), max_frames or len(dataset)),
+            replacement=True,
+            generator=generator,
+        ).numpy()
+        starts = np.asarray([0, *dataset.cumulative_sizes[:-1]])
+        ends = np.asarray(dataset.cumulative_sizes)
+        selections = [
+            selected[(selected >= start) & (selected < end)] - start
+            for start, end in zip(starts, ends, strict=True)
+        ]
+    else:
+        sources = (dataset,)
+        if max_frames is not None and max_frames < len(dataset):
+            generator = torch.Generator()
+            generator.manual_seed(0)
+            indices = torch.randperm(len(dataset), generator=generator)[:max_frames].numpy()
+        else:
+            indices = np.arange(len(dataset), dtype=np.int64)
+        selections = (indices,)
+
+    delta_mask = None
+    for transform in data_config.data_transforms.inputs:
+        if isinstance(transform, transforms.DeltaActions):
+            delta_mask = np.asarray(transform.mask, dtype=bool)
+            break
+
+    stats = {key: normalize.RunningStats() for key in ("state", "actions")}
+    print(
+        "Vectorized norm stats: "
+        f"{sum(len(indices) for indices in selections)} frames, "
+        f"{len(sources)} source(s), no image/video decoding"
+    )
+    offsets = np.arange(action_horizon, dtype=np.int64)
+    for source, indices in zip(sources, selections, strict=True):
+        states = _numpy_column(source, "observation.state").astype(np.float32, copy=False)
+        actions = _numpy_column(source, "action").astype(np.float32, copy=False)
+        episode_ids = _numpy_column(source, "episode_index").reshape(-1)
+        boundary = np.flatnonzero(np.r_[episode_ids[1:] != episode_ids[:-1], True])
+        episode_end_by_frame = np.empty(len(source), dtype=np.int64)
+        begin = 0
+        for end in boundary:
+            episode_end_by_frame[begin : end + 1] = end
+            begin = end + 1
+
+        for offset in range(0, len(indices), chunk_size):
+            frame_indices = indices[offset : offset + chunk_size]
+            state_batch = states[frame_indices]
+            horizon_indices = np.minimum(
+                frame_indices[:, None] + offsets[None, :],
+                episode_end_by_frame[frame_indices, None],
+            )
+            action_batch = actions[horizon_indices].copy()
+            if delta_mask is not None:
+                dims = len(delta_mask)
+                action_batch[..., :dims] -= np.where(
+                    delta_mask, state_batch[..., :dims], 0
+                )[:, None, :]
+            stats["state"].update(state_batch)
+            stats["actions"].update(action_batch)
+
+    return {key: value.get_statistics() for key, value in stats.items()}
 
 
 def create_torch_dataloader(
@@ -148,6 +244,17 @@ def main(
         )
     data_config = config.data.create(config.assets_dirs, config.model)
 
+    if state_action_only and data_config.rlds_data_dir is None:
+        norm_stats = compute_state_action_stats(
+            data_config,
+            config.model.action_horizon,
+            config.model,
+            max_frames=max_frames,
+        )
+        output_path = config.assets_dirs / data_config.repo_id
+        print(f"Writing vectorized state/action stats to: {output_path}")
+        normalize.save(output_path, norm_stats)
+        return
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
