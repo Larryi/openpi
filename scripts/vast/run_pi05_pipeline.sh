@@ -574,7 +574,17 @@ for index, source in enumerate(sources, 1):
 
 output = Path(os.environ["MIX_RESOLVED_FILE"])
 output.write_text(json.dumps(resolved, indent=2))
-digest = hashlib.sha256(json.dumps(resolved, sort_keys=True).encode()).hexdigest()[:10]
+cache_identity = [
+    {
+        key: source.get(key)
+        for key in ("name", "repo_id", "weight", "revision", "episodes")
+        if source.get(key) is not None
+    }
+    for source in resolved
+]
+digest = hashlib.sha256(
+    json.dumps(cache_identity, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()[:10]
 (output.parent / "dataset_mix.asset_id").write_text(digest)
 print("Weighted dataset mixture ready:")
 for source in resolved:
