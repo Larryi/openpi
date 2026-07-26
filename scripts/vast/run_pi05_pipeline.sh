@@ -18,9 +18,9 @@ umask 077
 : "${NUM_WORKERS:=8}"
 : "${TRAIN_VIDEO_BACKEND:=torchcodec}"
 : "${PYTORCH_INDEX_URL:=https://download.pytorch.org/whl/cu128}"
-: "${TORCH_VERSION:=2.11.0+cu128}"
-: "${TORCHVISION_VERSION:=0.26.0+cu128}"
-: "${TORCHCODEC_VERSION:=0.11.1}"
+: "${TORCH_VERSION:=2.7.1}"
+: "${TORCHVISION_VERSION:=0.22.1}"
+: "${TORCHCODEC_VERSION:=0.5}"
 : "${NORM_NUM_WORKERS:=0}"
 : "${NORM_BATCH_SIZE:=32}"
 : "${NORM_REPO:=${MODEL_REPO}}"
@@ -471,17 +471,14 @@ if [[ "${CUDA_NVCC_VERSION}" != "auto" ]]; then
   retry 3 uv pip install --python "${PYTHON}" \
     "nvidia-cuda-nvcc-cu12==${CUDA_NVCC_VERSION}"
 fi
-# The repository lock still carries the older Torch 2.7 / TorchCodec 0.4 pair.
-# The proven local Kuavo training environment uses the CUDA 12.8 Blackwell
-# wheels below; TorchCodec 0.11 fixes the spawned-worker decoder crashes and
-# restores the original eight-worker input throughput.
+# Keep OpenPI's pinned Torch 2.7 family, but move TorchCodec from 0.4 to the
+# latest compatible 0.5 release to avoid native spawned-worker decoder crashes.
+# The cu128 variant is selected by the official index URL, not a +cu128
+# requirement suffix.
 retry 3 uv pip install --python "${PYTHON}" \
   --index-url "${PYTORCH_INDEX_URL}" \
   "torch==${TORCH_VERSION}" \
-  "torchvision==${TORCHVISION_VERSION}"
-retry 3 uv pip install --python "${PYTHON}" \
-  --index-url "https://pypi.org/simple" \
-  --no-deps \
+  "torchvision==${TORCHVISION_VERSION}" \
   "torchcodec==${TORCHCODEC_VERSION}"
 CUDA_NVCC_VERSION="$(
   "${PYTHON}" -c \
@@ -490,16 +487,19 @@ CUDA_NVCC_VERSION="$(
 echo "Resolved CUDA NVCC Python package: ${CUDA_NVCC_VERSION}"
 "${PYTHON}" - <<'PY'
 from importlib.metadata import version
+from packaging.version import Version
 
 expected = {
     "huggingface-hub": "0.32.3",
     "transformers": "4.53.2",
-    "torch": "2.11.0+cu128",
-    "torchvision": "0.26.0+cu128",
-    "torchcodec": "0.11.1",
+    "torch": "2.7.1",
+    "torchvision": "0.22.1",
+    "torchcodec": "0.5",
 }
 actual = {package: version(package) for package in expected}
-assert actual == expected, (actual, expected)
+assert {
+    package: Version(value).base_version for package, value in actual.items()
+} == expected, (actual, expected)
 print("Frozen Python dependency versions passed:", actual)
 PY
 touch "${environment_stamp}"
