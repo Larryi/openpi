@@ -127,7 +127,7 @@ while true; do
     1)
       GPU_IDS="0"; GPU_COUNT="1"; FSDP_DEVICES="1"
       REQUIRE_GPU_NAME="RTX PRO 6000"; MIN_GPU_MEMORY_MB="90000"; MIN_GPU_FREE_MB="88000"
-      CUDA_NVCC_VERSION="12.8.93"; EMA_DECAY="None"; REMAT_POLICY="dots_with_no_batch_dims_saveable"
+      CUDA_NVCC_VERSION="auto"; EMA_DECAY="None"; REMAT_POLICY="dots_with_no_batch_dims_saveable"
       default_batch="$([[ "${PIPELINE_MODE}" == "smoke" ]] && echo 1 || echo 16)"
       gpu_slug="rtxpro6000"
       break
@@ -135,7 +135,7 @@ while true; do
     2)
       GPU_IDS="0,1,2,3"; GPU_COUNT="4"; FSDP_DEVICES="4"
       REQUIRE_GPU_NAME="A100"; MIN_GPU_MEMORY_MB="79000"; MIN_GPU_FREE_MB="70000"
-      CUDA_NVCC_VERSION="12.6.85"; EMA_DECAY="0.99"; REMAT_POLICY="nothing_saveable"
+      CUDA_NVCC_VERSION="auto"; EMA_DECAY="0.99"; REMAT_POLICY="nothing_saveable"
       default_batch="$([[ "${PIPELINE_MODE}" == "smoke" ]] && echo 4 || echo 32)"
       gpu_slug="a100x4"
       break
@@ -147,7 +147,7 @@ while true; do
       prompt REQUIRE_GPU_NAME "Required GPU name substring" "A100"
       prompt MIN_GPU_MEMORY_MB "Minimum total memory MiB" "79000"
       prompt MIN_GPU_FREE_MB "Minimum free memory MiB" "70000"
-      prompt CUDA_NVCC_VERSION "nvidia-cuda-nvcc-cu12 version" "12.6.85"
+      prompt CUDA_NVCC_VERSION "nvidia-cuda-nvcc-cu12 version (auto uses uv.lock)" "auto"
       prompt EMA_DECAY "EMA decay (None disables it)" "None"
       prompt REMAT_POLICY "Remat policy" "nothing_saveable"
       default_batch="${GPU_COUNT}"

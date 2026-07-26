@@ -25,7 +25,7 @@ umask 077
 : "${BASE_PARAMS:=gs://openpi-assets/checkpoints/pi05_base/params}"
 : "${PALIGEMMA_REPO:=google/paligemma-3b-pt-224}"
 : "${OPENPI_PYTHON_VERSION:=3.11}"
-: "${CUDA_NVCC_VERSION:=12.6.85}"
+: "${CUDA_NVCC_VERSION:=auto}"
 : "${RUN_ID:=${ROBOT_TASK}_pi05_gpu${GPU_COUNT}_$(date +%Y%m%d_%H%M%S)}"
 : "${AUTO_UPLOAD:=1}"
 : "${OVERWRITE:=0}"
@@ -412,9 +412,18 @@ fi
 "${PYTHON}" -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version'
 cd "${CODE_DIR}"
 retry 3 uv sync --python "${PYTHON}" --frozen --no-group dev
-# Keep A100 on the JAX 0.5.3 CUDA 12.6 toolchain by default. Blackwell profiles must override this
-# with CUDA 12.8+, which is the first toolkit generation with native Blackwell compiler support.
-retry 3 uv pip install --python "${PYTHON}" "nvidia-cuda-nvcc-cu12==${CUDA_NVCC_VERSION}"
+# The frozen lock currently provides CUDA NVCC 12.9. Do not downgrade it: CUDA 12.8+
+# is required to compile for Blackwell. An explicit version remains available for
+# reproducing an older platform, and is validated against the selected GPU below.
+if [[ "${CUDA_NVCC_VERSION}" != "auto" ]]; then
+  retry 3 uv pip install --python "${PYTHON}" \
+    "nvidia-cuda-nvcc-cu12==${CUDA_NVCC_VERSION}"
+fi
+CUDA_NVCC_VERSION="$(
+  "${PYTHON}" -c \
+    'from importlib.metadata import version; print(version("nvidia-cuda-nvcc-cu12"))'
+)"
+echo "Resolved CUDA NVCC Python package: ${CUDA_NVCC_VERSION}"
 "${PYTHON}" - <<'PY'
 from importlib.metadata import version
 
