@@ -985,10 +985,10 @@ from huggingface_hub import snapshot_download
 selected_step = os.environ["OPENPI_RESUME_FROM_STEP"]
 allow_patterns = None
 if selected_step != "latest":
-    allow_patterns = [
-        f"{selected_step}/**",
-        *(["wandb_id.txt"] if os.environ["RESUME_STATE_MODE"] == "full" else []),
-    ]
+    if os.environ["RESUME_STATE_MODE"] == "weights_only":
+        allow_patterns = [f"{selected_step}/params/**"]
+    else:
+        allow_patterns = [f"{selected_step}/**", "wandb_id.txt"]
 
 snapshot_download(
     repo_id=os.environ["RESUME_REPO"],
