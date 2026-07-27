@@ -44,6 +44,8 @@ umask 077
 : "${OVERWRITE:=0}"
 : "${RESUME:=0}"
 : "${RESUME_REPO:=${MODEL_REPO}}"
+: "${RESUME_STATE_MODE:=${OPENPI_RESUME_STATE_MODE:-full}}"
+: "${OPENPI_RESUME_FROM_STEP:=latest}"
 : "${AUTO_STOP_INSTANCE:=0}"
 : "${AUTO_STOP_ON_FAILURE:=0}"
 : "${AUTO_STOP_ON_UPLOAD_FAILURE:=0}"
@@ -81,6 +83,21 @@ case "${TRAIN_VIDEO_BACKEND}" in
   torchcodec|pyav|video_reader) ;;
   *) echo "TRAIN_VIDEO_BACKEND must be torchcodec, pyav, or video_reader" >&2; exit 2 ;;
 esac
+case "${RESUME_STATE_MODE}" in
+  full|weights_only) ;;
+  *) echo "RESUME_STATE_MODE must be full or weights_only" >&2; exit 2 ;;
+esac
+if [[ "${RESUME}" == "1" ]]; then
+  if [[ "${RESUME_STATE_MODE}" == "weights_only" ]]; then
+    [[ "${OPENPI_RESUME_FROM_STEP}" =~ ^[1-9][0-9]*$ ]] || {
+      echo "weights_only requires OPENPI_RESUME_FROM_STEP to select a positive finalized checkpoint step" >&2
+      exit 2
+    }
+  elif [[ "${OPENPI_RESUME_FROM_STEP}" != "latest" && ! "${OPENPI_RESUME_FROM_STEP}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "OPENPI_RESUME_FROM_STEP must be latest or a positive finalized checkpoint step" >&2
+    exit 2
+  fi
+fi
 
 lr_tail_value_count=0
 for value in LR_TAIL_START_STEP LR_TAIL_DECAY_STEPS LR_TAIL_DECAY_LR; do
@@ -463,7 +480,7 @@ on_exit() {
     latest_local_step="$(find "${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${RUN_ID}" \
       -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' 2>/dev/null \
       | sort -n | tail -n 1)"
-    if [[ -n "${OPENPI_RESUME_FROM_STEP:-}" && -n "${latest_local_step}" ]] \
+    if [[ "${RESUME_STATE_MODE}" == "full" && "${OPENPI_RESUME_FROM_STEP}" =~ ^[1-9][0-9]*$ && -n "${latest_local_step}" ]] \
       && (( latest_local_step <= OPENPI_RESUME_FROM_STEP )); then
       UPLOAD_STATUS="no_new_checkpoint"
       echo "Training produced no checkpoint newer than resumed step ${OPENPI_RESUME_FROM_STEP}; skipping fallback upload" >&2
@@ -849,6 +866,14 @@ for key in ("state", "actions"):
 print("Normalization validation passed:", os.environ["NORM_FILE"])
 PY
 
+run_dir="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${RUN_ID}"
+resume_download_dir="${run_dir}"
+train_initial_params="${BASE_PARAMS}"
+if [[ "${RESUME}" == "1" && "${RESUME_STATE_MODE}" == "weights_only" ]]; then
+  resume_download_dir="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/.resume-${RUN_ID}-step${OPENPI_RESUME_FROM_STEP}"
+  train_initial_params="${resume_download_dir}/${OPENPI_RESUME_FROM_STEP}/params"
+fi
+
 cat >"${MANIFEST}" <<EOF
 {
   "run_id": "${RUN_ID}",
@@ -857,7 +882,9 @@ cat >"${MANIFEST}" <<EOF
   "dataset_repo": "${DATASET_REPO}",
   "dataset_root": "${DATASET_ROOT}",
   "dataset_mix": ${KUAVO_DATASET_MIX_JSON:-null},
-  "base_params": "${BASE_PARAMS}",
+  "base_params": "${train_initial_params}",
+  "resume_state_mode": "${RESUME_STATE_MODE}",
+  "resume_from_step": "${OPENPI_RESUME_FROM_STEP}",
   "gpu_ids": "${GPU_IDS}",
   "gpu_count": ${GPU_COUNT},
   "fsdp_devices": ${FSDP_DEVICES},
@@ -892,7 +919,7 @@ train_args=(
   --data.tokenizer-path "${TOKENIZER_PATH}"
   --data.assets.assets-dir "${ASSETS_BASE_DIR}/${CONFIG_NAME}"
   --data.assets.asset-id "${NORM_ASSET_ID}"
-  --weight-loader.params-path "${BASE_PARAMS}"
+  --weight-loader.params-path "${train_initial_params}"
   --assets-base-dir "${ASSETS_BASE_DIR}"
   --checkpoint-base-dir "${CHECKPOINT_BASE_DIR}"
   --batch-size "${GLOBAL_BATCH_SIZE}"
@@ -930,18 +957,20 @@ if [[ "${PIPELINE_MODE}" == "smoke" ]]; then
 else
   train_args+=(--num-train-steps "${NUM_TRAIN_STEPS}")
 fi
-run_dir="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${RUN_ID}"
 if [[ "${RESUME}" == "1" ]]; then
-  resume_complete_marker="${run_dir}/.kuavo_hf_resume_complete"
+  resume_marker_value="${RESUME_REPO}:${OPENPI_RESUME_FROM_STEP}:${RESUME_STATE_MODE}"
+  resume_complete_marker="${resume_download_dir}/.kuavo_hf_resume_complete"
   if [[ ! -f "${resume_complete_marker}" ]] \
-    || [[ "$(cat "${resume_complete_marker}" 2>/dev/null)" != "${RESUME_REPO}" ]]; then
+    || [[ "$(cat "${resume_complete_marker}" 2>/dev/null)" != "${resume_marker_value}" ]]; then
     PIPELINE_PHASE="download checkpoint for resume"
-    resume_staging_dir="${run_dir}.hf-download"
+    resume_staging_dir="${resume_download_dir}.hf-download"
     mkdir -p "${resume_staging_dir}"
     echo "Downloading resume checkpoint into staging directory: ${resume_staging_dir}"
     echo "A file-count progress bar can pause while one large checkpoint shard is still transferring."
     download_resume_checkpoint() {
-      RESUME_REPO="${RESUME_REPO}" RUN_DIR="${run_dir}" RESUME_STAGING_DIR="${resume_staging_dir}" \
+      RESUME_REPO="${RESUME_REPO}" RESUME_DOWNLOAD_DIR="${resume_download_dir}" \
+        RESUME_STAGING_DIR="${resume_staging_dir}" RESUME_STATE_MODE="${RESUME_STATE_MODE}" \
+        OPENPI_RESUME_FROM_STEP="${OPENPI_RESUME_FROM_STEP}" RESUME_MARKER_VALUE="${resume_marker_value}" \
         RESUME_HF_DOWNLOAD_WORKERS="${RESUME_HF_DOWNLOAD_WORKERS}" \
         timeout --signal=TERM "${RESUME_DOWNLOAD_ATTEMPT_SECONDS}" \
         env HF_HUB_DISABLE_XET=1 \
@@ -953,30 +982,48 @@ from pathlib import Path
 import shutil
 from huggingface_hub import snapshot_download
 
+selected_step = os.environ["OPENPI_RESUME_FROM_STEP"]
+allow_patterns = None
+if selected_step != "latest":
+    allow_patterns = [
+        f"{selected_step}/**",
+        *(["wandb_id.txt"] if os.environ["RESUME_STATE_MODE"] == "full" else []),
+    ]
+
 snapshot_download(
     repo_id=os.environ["RESUME_REPO"],
     repo_type="model",
     local_dir=os.environ["RESUME_STAGING_DIR"],
+    allow_patterns=allow_patterns,
     max_workers=int(os.environ["RESUME_HF_DOWNLOAD_WORKERS"]),
     token=os.environ["HF_TOKEN"],
 )
 staging = Path(os.environ["RESUME_STAGING_DIR"])
 (staging / ".kuavo_hf_resume_complete").write_text(
-    os.environ["RESUME_REPO"], encoding="utf-8"
+    os.environ["RESUME_MARKER_VALUE"], encoding="utf-8"
 )
-run_dir = Path(os.environ["RUN_DIR"])
-if run_dir.exists():
-    shutil.rmtree(run_dir)
-staging.replace(run_dir)
-print(f"Resume checkpoint download finalized atomically: {run_dir}")
+download_dir = Path(os.environ["RESUME_DOWNLOAD_DIR"])
+if download_dir.exists():
+    shutil.rmtree(download_dir)
+staging.replace(download_dir)
+print(f"Resume checkpoint download finalized atomically: {download_dir}")
 PY
     }
     echo "Resume download transport: HTTP (Xet disabled), workers=${RESUME_HF_DOWNLOAD_WORKERS}, attempt timeout=${RESUME_DOWNLOAD_ATTEMPT_SECONDS}s"
     retry "${RESUME_DOWNLOAD_RETRIES}" download_resume_checkpoint
   else
-    echo "Using completed resume checkpoint: ${run_dir}"
+    echo "Using completed resume checkpoint: ${resume_download_dir}"
   fi
-  train_args+=(--resume)
+  if [[ "${RESUME_STATE_MODE}" == "full" ]]; then
+    train_args+=(--resume)
+  elif [[ -d "${run_dir}" ]]; then
+    if [[ "${OVERWRITE}" == "1" ]]; then
+      train_args+=(--overwrite)
+    else
+      echo "Weights-only output run already exists: ${run_dir}; set OVERWRITE=1 or choose a new RUN_ID" >&2
+      exit 6
+    fi
+  fi
 else
   if [[ -d "${run_dir}" ]]; then
     if [[ "${OVERWRITE}" == "1" ]]; then
