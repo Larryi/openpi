@@ -76,7 +76,13 @@ class Policy(BasePolicy):
                 raise ValueError("RTC request is missing prev_actions")
             # Feed physical-space leftover actions through the exact training input pipeline so normalization and action
             # padding match the model. SO101Inputs maps the dataset-style singular key to model-space `actions`.
-            inputs["action"] = np.asarray(rtc["prev_actions"], dtype=np.float32)
+            # Arrays decoded from msgpack can be read-only views over the
+            # receive buffer. DeltaActions normalizes this field in place, so
+            # RTC must own a writable copy before entering the transform chain.
+            inputs["action"] = np.asarray(
+                rtc["prev_actions"],
+                dtype=np.float32,
+            ).copy()
         inputs = self._input_transform(inputs)
         rtc_prev_actions = inputs.pop("actions", None) if rtc is not None else None
         if rtc is not None and rtc_prev_actions is None:
